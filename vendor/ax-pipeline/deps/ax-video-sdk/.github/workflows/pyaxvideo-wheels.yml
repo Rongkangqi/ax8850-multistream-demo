@@ -1,0 +1,66 @@
+name: pyaxvideo wheels
+
+# Rolling 发布:构建产物覆盖上传到固定 tag `pyaxvideo-latest` 的 prerelease,
+# 版本号不自增,whl 文件名固定 → 下载链接永久有效:
+#   https://github.com/AXERA-TECH/ax-video-sdk/releases/download/pyaxvideo-latest/pyaxvideo-0.1.1-py3-none-linux_x86_64.whl
+#   https://github.com/AXERA-TECH/ax-video-sdk/releases/download/pyaxvideo-latest/pyaxvideo-0.1.1-py3-none-linux_aarch64.whl
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "pyaxvideo/**"
+      - "src/**"
+      - "include/**"
+      - "third-party/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/pyaxvideo-wheels.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  wheels:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Download AXCL SDK (x86 + arm64) and AX650 MSP
+        run: |
+          mkdir -p deps-dl && cd deps-dl
+          curl -sL -o axcl.zip https://github.com/ZHEQIUSHUI/assets/releases/download/ax_3.6.2/axcl_linux_3.10.2.zip
+          unzip -q axcl.zip
+          curl -sL -o msp.zip https://github.com/ZHEQIUSHUI/assets/releases/download/ax_3.6.2/msp_50_3.10.2.zip
+          unzip -q msp.zip
+
+      - name: Download aarch64 toolchain
+        run: |
+          curl -sL -o tc.tar.xz https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
+          tar xJf tc.tar.xz
+          echo "$PWD/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu/bin" >> "$GITHUB_PATH"
+
+      - name: Build wheels
+        run: |
+          pip install -q setuptools wheel
+          cd pyaxvideo
+          AXCL_ROOT=$(find "$GITHUB_WORKSPACE/deps-dl" -maxdepth 3 -type d -name "axcl_linux_x86" | head -1)
+          AXCL_ARM64=$(find "$GITHUB_WORKSPACE/deps-dl" -maxdepth 3 -type d -name "axcl_linux_arm64" | head -1)
+          MSP_ROOT=$(find "$GITHUB_WORKSPACE/deps-dl" -maxdepth 3 -type d -name msp | head -1)
+          AXCL_X86_DIR="$AXCL_ROOT" ./scripts/build_wheels.sh x86
+          TOOLCHAIN_FILE="$GITHUB_WORKSPACE/toolchains/aarch64-none-linux-gnu.toolchain.cmake" \
+            MSP_DIR="$MSP_ROOT" AXCL_ARM64_DIR="$AXCL_ARM64" ./scripts/build_wheels.sh aarch64
+          ls -la dist/
+
+      - name: Publish to rolling release (fixed links)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view pyaxvideo-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create pyaxvideo-latest --repo "$GITHUB_REPOSITORY" --prerelease \
+              --title "pyaxvideo (rolling)" \
+              --notes "Rolling build of the pyaxvideo wheels from main. Assets are overwritten on every update; download links are permanent."
+          gh release upload pyaxvideo-latest pyaxvideo/dist/*.whl --repo "$GITHUB_REPOSITORY" --clobber

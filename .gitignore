@@ -1,0 +1,10 @@
+/build/
+/run/
+/logs/
+/recordings/
+__pycache__/
+*.pyc
+*.partial
+*.log
+.DS_Store
+Thumbs.db

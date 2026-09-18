@@ -1,0 +1,1730 @@
+#include <rtsp-client/rtsp_client.h>
+#include <rtsp-common/socket.h>
+#include <rtsp-common/rtsp_request.h>
+#include <rtsp-common/sdp.h>
+#include <rtsp-common/common.h>
+#include <cstring>
+#include <sstream>
+#include <thread>
+#include <queue>
+#include <regex>
+#include <map>
+#include <unordered_map>
+#include <iomanip>
+#include <future>
+#include <algorithm>
+#include <cctype>
+
+namespace rtsp {
+
+namespace {
+
+bool responseHasStatusCode(const std::string& response, int code) {
+    return response.find(std::to_string(code)) != std::string::npos;
+}
+
+std::shared_ptr<std::vector<uint8_t>> makeManagedBuffer(const uint8_t* data, size_t size) {
+    auto buf = std::make_shared<std::vector<uint8_t>>();
+    if (data && size > 0) {
+        buf->assign(data, data + size);
+    }
+    return buf;
+}
+
+VideoFrame cloneFrameManaged(const VideoFrame& src) {
+    VideoFrame copy = src;
+    copy.managed_data = makeManagedBuffer(src.data, src.size);
+    copy.data = copy.managed_data->empty() ? nullptr : copy.managed_data->data();
+    copy.size = copy.managed_data->size();
+    return copy;
+}
+
+void releaseFrameData(VideoFrame& frame) {
+    frame.managed_data.reset();
+    frame.data = nullptr;
+    frame.size = 0;
+}
+
+bool joinThreadWithTimeout(std::thread& t, uint32_t timeout_ms) {
+    if (!t.joinable()) {
+        return true;
+    }
+
+    std::thread owned = std::move(t);
+    std::promise<void> done;
+    auto fut = done.get_future();
+    std::thread joiner([owned = std::move(owned), done = std::move(done)]() mutable {
+        if (owned.joinable()) {
+            owned.join();
+        }
+        done.set_value();
+    });
+
+    if (fut.wait_for(std::chrono::milliseconds(timeout_ms)) == std::future_status::ready) {
+        joiner.join();
+        return true;
+    }
+
+    joiner.detach();
+    return false;
+}
+
+bool parseContentLength(const std::string& headers, std::size_t* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    static const std::regex kContentLengthRegex("Content-Length\\s*:\\s*(\\d+)", std::regex::icase);
+    std::smatch match;
+    if (!std::regex_search(headers, match, kContentLengthRegex)) {
+        return false;
+    }
+
+    try {
+        *out = static_cast<std::size_t>(std::stoull(match[1].str()));
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// 恶意/畸形 RTSP 服务器可发超大 Content-Length 或永不终止的 header 撑爆内存；加上限。
+static constexpr std::size_t kMaxRtspRespHeaderBytes = 64 * 1024;
+static constexpr std::size_t kMaxRtspRespBodyBytes   = 2 * 1024 * 1024;
+
+bool recvRtspResponse(Socket* socket, std::string* response, int timeout_ms) {
+    if (socket == nullptr || response == nullptr) {
+        return false;
+    }
+
+    response->clear();
+
+    const auto timeout = std::chrono::milliseconds(std::max(0, timeout_ms));
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+
+    std::size_t expected_total_size = 0;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto remain =
+            static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+        const int poll_timeout_ms = std::min(200, std::max(1, remain));
+
+        char buffer[4096];
+        const ssize_t len = socket->recv(reinterpret_cast<std::uint8_t*>(buffer), sizeof(buffer), poll_timeout_ms);
+        if (len > 0) {
+            response->append(buffer, static_cast<std::size_t>(len));
+
+            if (expected_total_size == 0) {
+                const auto header_end_pos = response->find("\r\n\r\n");
+                if (header_end_pos != std::string::npos) {
+                    const std::size_t header_size = header_end_pos + 4;
+                    std::size_t content_length = 0;
+                    if (parseContentLength(response->substr(0, header_size), &content_length)) {
+                        if (content_length > kMaxRtspRespBodyBytes) return false;   // body 超限
+                        expected_total_size = header_size + content_length;
+                    } else {
+                        expected_total_size = header_size;
+                    }
+                } else if (response->size() > kMaxRtspRespHeaderBytes) {
+                    return false;   // header 超限仍无终止 → 拒绝
+                }
+            }
+
+            if (expected_total_size != 0 && response->size() >= expected_total_size) {
+                // Do not return extra bytes if the peer pipelined multiple RTSP responses.
+                response->resize(expected_total_size);
+                return true;
+            }
+        } else if (len == 0) {
+            // Peer closed.
+            break;
+        } else {
+            // Timeout / transient error.
+            continue;
+        }
+    }
+
+    return false;
+}
+
+} // namespace
+
+// RTP接收器实现（简化版）
+class RtpReceiver {
+public:
+    struct StatsSnapshot {
+        uint64_t packets_received = 0;
+        uint64_t packets_reordered = 0;
+        uint64_t packet_loss_events = 0;
+        uint64_t frames_output = 0;
+    };
+
+    RtpReceiver() = default;
+    ~RtpReceiver() { stop(); }
+
+    bool init(uint16_t rtp_port, uint16_t rtcp_port) {
+        // reuse_addr=false：同机多个客户端并发时，避免因 SO_REUSEADDR 抢占同一 RTP 端口
+        // 而互相丢包；绑定失败会让上层 SETUP 循环换下一个端口。
+        if (!rtp_socket_.bindUdp("0.0.0.0", rtp_port, /*reuse_addr=*/false)) {
+            return false;
+        }
+        if (!rtcp_socket_.bindUdp("0.0.0.0", rtcp_port, /*reuse_addr=*/false)) {
+            return false;
+        }
+        rtp_socket_.setNonBlocking(true);
+        rtcp_socket_.setNonBlocking(true);
+        rtp_port_ = rtp_port;
+        rtcp_port_ = rtcp_port;
+        return true;
+    }
+
+    void start() {
+        if (running_) return;
+        running_ = true;
+        receive_thread_ = std::thread([this]() { receiveLoop(); });
+    }
+
+    bool stopWithTimeout(uint32_t timeout_ms) {
+        if (!running_ && !receive_thread_.joinable()) {
+            return true;
+        }
+        running_ = false;
+        rtp_socket_.shutdownReadWrite();
+        rtcp_socket_.shutdownReadWrite();
+        if (rtp_port_ != 0) {
+            // Wake a potentially blocking recvFrom on some platforms.
+            Socket wake_socket;
+            if (wake_socket.bindUdp("0.0.0.0", 0)) {
+                uint8_t b = 0;
+                wake_socket.sendTo(&b, 1, "127.0.0.1", rtp_port_);
+            }
+        }
+        bool joined = joinThreadWithTimeout(receive_thread_, timeout_ms);
+        rtp_socket_.close();
+        rtcp_socket_.close();
+        return joined;
+    }
+
+    void stop() {
+        (void)stopWithTimeout(2000);
+    }
+
+    void setCallback(FrameCallback callback) {
+        callback_ = callback;
+    }
+
+    void setVideoInfo(CodecType codec, uint32_t width, uint32_t height, uint32_t fps, uint8_t payload_type) {
+        codec_ = codec;
+        width_ = width;
+        height_ = height;
+        fps_ = fps;
+        payload_type_ = payload_type;
+    }
+
+    void setJitterBufferPackets(uint32_t packets) {
+        jitter_buffer_packets_ = packets == 0 ? 1 : packets;
+    }
+
+    StatsSnapshot getStats() const {
+        StatsSnapshot s;
+        s.packets_received = packets_received_.load();
+        s.packets_reordered = packets_reordered_.load();
+        s.packet_loss_events = packet_loss_events_.load();
+        s.frames_output = frames_output_.load();
+        return s;
+    }
+
+    static uint32_t parseRtpTimestampFromRaw(const uint8_t* data, size_t len) {
+        if (!data || len < 8) return 0;
+        return (static_cast<uint32_t>(data[4]) << 24) |
+               (static_cast<uint32_t>(data[5]) << 16) |
+               (static_cast<uint32_t>(data[6]) << 8) |
+               static_cast<uint32_t>(data[7]);
+    }
+
+    static uint32_t parseRtpTimestampFromPacket(const std::vector<uint8_t>& packet) {
+        return parseRtpTimestampFromRaw(packet.data(), packet.size());
+    }
+
+    void ingestRtpPacket(const uint8_t* data, size_t len) {
+        if (!data || len < 12) return;
+        uint16_t seq = static_cast<uint16_t>((data[2] << 8) | data[3]);
+        uint32_t ts = parseRtpTimestampFromRaw(data, len);
+        packets_received_++;
+
+        if (!reorder_initialized_) {
+            expected_seq_ = seq;
+            reorder_initialized_ = true;
+        }
+        if (seq != expected_seq_) {
+            packets_reordered_++;
+        }
+
+        reorder_buffer_[seq] = std::vector<uint8_t>(data, data + len);
+
+        while (true) {
+            auto it = reorder_buffer_.find(expected_seq_);
+            if (it == reorder_buffer_.end()) break;
+            processRtpPacket(it->second.data(), it->second.size());
+            reorder_buffer_.erase(it);
+            expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+        }
+
+        if (reorder_buffer_.size() > jitter_buffer_packets_) {
+            auto it = reorder_buffer_.begin();
+            expected_seq_ = it->first;
+            while (true) {
+                auto run = reorder_buffer_.find(expected_seq_);
+                if (run == reorder_buffer_.end()) break;
+                processRtpPacket(run->second.data(), run->second.size());
+                reorder_buffer_.erase(run);
+                expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+            }
+        }
+
+        // If we're stuck waiting for a missing sequence and packets from a newer RTP timestamp
+        // have already arrived, force-advance to avoid indefinite head-of-line blocking.
+        if (!reorder_buffer_.empty() && reorder_buffer_.find(expected_seq_) == reorder_buffer_.end()) {
+            auto first_it = reorder_buffer_.begin();
+            uint32_t first_ts = parseRtpTimestampFromPacket(first_it->second);
+            if (ts != first_ts) {
+                if (expected_seq_ != first_it->first) {
+                    packet_loss_events_++;
+                }
+                expected_seq_ = first_it->first;
+                while (true) {
+                    auto run = reorder_buffer_.find(expected_seq_);
+                    if (run == reorder_buffer_.end()) break;
+                    processRtpPacket(run->second.data(), run->second.size());
+                    reorder_buffer_.erase(run);
+                    expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+                }
+            }
+        }
+    }
+
+    uint16_t getRtpPort() const { return rtp_port_; }
+    uint16_t getRtcpPort() const { return rtcp_port_; }
+
+private:
+    // 单帧组装上限：不可信服务器若始终不置 RTP marker/不变时间戳，frame_buffer_ 会
+    // 无限增长 → 内存耗尽。超限即丢弃在建帧。
+    static constexpr size_t kMaxAssembledFrameBytes = 8 * 1024 * 1024;
+
+    void appendAnnexBNalu(const uint8_t* nalu, size_t len) {
+        if (!nalu || len == 0) return;
+        if (frame_buffer_.size() + len + 4 > kMaxAssembledFrameBytes) {
+            clearCurrentFrameState();
+            return;
+        }
+        static const uint8_t start_code[] = {0x00, 0x00, 0x00, 0x01};
+        frame_buffer_.insert(frame_buffer_.end(), start_code, start_code + 4);
+        frame_buffer_.insert(frame_buffer_.end(), nalu, nalu + len);
+    }
+
+    bool isH265Irap(uint8_t nal_type) const {
+        return nal_type >= 16 && nal_type <= 21;
+    }
+
+    void clearCurrentFrameState() {
+        frame_buffer_.clear();
+        frame_is_idr_ = false;
+        frame_in_progress_ = false;
+    }
+
+    void emitFrame(uint32_t timestamp) {
+        if (frame_buffer_.empty()) return;
+
+        VideoFrame frame;
+        frame.codec = codec_;
+        frame.pts = timestamp / 90;
+        frame.dts = frame.pts;
+        frame.width = width_;
+        frame.height = height_;
+        frame.fps = fps_;
+        frame.type = frame_is_idr_ ? FrameType::IDR : FrameType::P;
+        frame.managed_data = makeManagedBuffer(frame_buffer_.data(), frame_buffer_.size());
+        frame.data = frame.managed_data->empty() ? nullptr : frame.managed_data->data();
+        frame.size = frame.managed_data->size();
+
+        if (callback_) {
+            callback_(frame);
+        }
+        frames_output_++;
+        frame_buffer_.clear();
+        frame_is_idr_ = false;
+        frame_in_progress_ = false;
+    }
+
+    void receiveLoop() {
+        uint8_t buffer[65536];
+        std::string from_ip;
+        uint16_t from_port;
+
+        // 用 poll(200ms) 替代 1ms 忙等，减少嵌入式设备 idle 时的 CPU 占用。
+        // 停止路径通过 shutdownReadWrite + 自发 UDP 包唤醒。
+        while (running_) {
+            int r = rtp_socket_.waitReadable(200);
+            if (!running_) break;
+            if (r <= 0) continue;
+            ssize_t len = rtp_socket_.recvFrom(buffer, sizeof(buffer), from_ip, from_port);
+            if (len > 0) {
+                ingestRtpPacket(buffer, static_cast<size_t>(len));
+            }
+        }
+    }
+
+    void processRtpPacket(const uint8_t* data, size_t len) {
+        if (len < 12) return;
+
+        // 解析RTP头
+        uint8_t version = (data[0] >> 6) & 0x03;
+        if (version != 2) return;
+
+        bool marker = (data[1] >> 7) & 0x01;
+        uint8_t payload_type = data[1] & 0x7F;
+        uint16_t seq = static_cast<uint16_t>((data[2] << 8) | data[3]);
+        uint32_t timestamp = (data[4] << 24) | (data[5] << 16) | (data[6] << 8) | data[7];
+
+        if (seq_initialized_) {
+            uint16_t expected = static_cast<uint16_t>(last_seq_ + 1);
+            if (seq != expected) {
+                // H.265 FU packet loss: discard current FU assembly and wait for next FU start.
+                if (codec_ == CodecType::H265 && h265_fu_in_progress_) {
+                    packet_loss_events_++;
+                    h265_fu_drop_mode_ = true;
+                    h265_fu_in_progress_ = false;
+                    if (h265_fu_start_offset_ <= frame_buffer_.size()) {
+                        frame_buffer_.resize(h265_fu_start_offset_);
+                    } else {
+                        frame_buffer_.clear();
+                    }
+                }
+            }
+        }
+        seq_initialized_ = true;
+        last_seq_ = seq;
+
+        // 解析可变RTP头（CSRC/extension/padding）
+        uint8_t cc = data[0] & 0x0F;
+        bool extension = (data[0] & 0x10) != 0;
+        bool padding = (data[0] & 0x20) != 0;
+        size_t header_len = 12 + static_cast<size_t>(cc) * 4;
+        if (header_len > len) return;
+        if (extension) {
+            if (header_len + 4 > len) return;
+            uint16_t ext_words = static_cast<uint16_t>((data[header_len + 2] << 8) | data[header_len + 3]);
+            size_t ext_len = 4 + static_cast<size_t>(ext_words) * 4;
+            if (header_len + ext_len > len) return;
+            header_len += ext_len;
+        }
+        size_t payload_len = len - header_len;
+        if (padding) {
+            if (payload_len == 0) return;
+            uint8_t pad_len = data[len - 1];
+            if (pad_len == 0 || pad_len > payload_len) return;
+            payload_len -= pad_len;
+        }
+
+        const uint8_t* payload = data + header_len;
+        size_t payload_size = payload_len;
+        if (payload_size == 0) return;
+
+        // 处理H.264/H.265 payload（简化版）
+        processVideoPayload(payload, payload_size, timestamp, marker, payload_type);
+    }
+
+    void processVideoPayload(const uint8_t* data, size_t len, uint32_t timestamp, 
+                             bool marker, uint8_t payload_type) {
+        if (len == 0) return;
+
+        if (!frame_in_progress_) {
+            frame_ts_ = timestamp;
+            frame_in_progress_ = true;
+        } else if (timestamp != frame_ts_) {
+            if (codec_ == CodecType::H265 && h265_fu_drop_mode_) {
+                clearCurrentFrameState();
+                h265_fu_drop_mode_ = false;
+                h265_fu_in_progress_ = false;
+            } else {
+                emitFrame(frame_ts_);
+            }
+            frame_ts_ = timestamp;
+            frame_in_progress_ = true;
+        }
+
+        bool is_h264 = (payload_type == payload_type_ && codec_ == CodecType::H264);
+        if (is_h264) {
+            uint8_t nal_type = data[0] & 0x1F;
+            if (nal_type >= 1 && nal_type <= 23) {
+                appendAnnexBNalu(data, len);
+                if (nal_type == 5) frame_is_idr_ = true;
+            } else if (nal_type == 24) {
+                // STAP-A: [STAP-A hdr][nalu_size(2)][nalu]...
+                size_t off = 1;
+                while (off + 2 <= len) {
+                    uint16_t nalu_size = static_cast<uint16_t>((data[off] << 8) | data[off + 1]);
+                    off += 2;
+                    if (nalu_size == 0 || off + nalu_size > len) {
+                        break;
+                    }
+                    uint8_t inner_type = data[off] & 0x1F;
+                    appendAnnexBNalu(data + off, nalu_size);
+                    if (inner_type == 5) frame_is_idr_ = true;
+                    off += nalu_size;
+                }
+            } else if (nal_type == 25) {
+                // STAP-B: [STAP-B hdr][DON(2)][nalu_size(2)][nalu]...
+                if (len < 3) return;
+                size_t off = 3;
+                while (off + 2 <= len) {
+                    uint16_t nalu_size = static_cast<uint16_t>((data[off] << 8) | data[off + 1]);
+                    off += 2;
+                    if (nalu_size == 0 || off + nalu_size > len) {
+                        break;
+                    }
+                    uint8_t inner_type = data[off] & 0x1F;
+                    appendAnnexBNalu(data + off, nalu_size);
+                    if (inner_type == 5) frame_is_idr_ = true;
+                    off += nalu_size;
+                }
+            } else if (nal_type == 28 && len >= 2) {
+                uint8_t fu_header = data[1];
+                bool start = (fu_header & 0x80) != 0;
+                uint8_t reconstructed_nal = (data[0] & 0xE0) | (fu_header & 0x1F);
+                if (start) {
+                    static const uint8_t start_code[] = {0x00, 0x00, 0x00, 0x01};
+                    frame_buffer_.insert(frame_buffer_.end(), start_code, start_code + 4);
+                    frame_buffer_.push_back(reconstructed_nal);
+                    if ((reconstructed_nal & 0x1F) == 5) frame_is_idr_ = true;
+                }
+                if (len > 2) {
+                    if (frame_buffer_.size() + (len - 2) > kMaxAssembledFrameBytes) {
+                        clearCurrentFrameState(); return;   // FU 分片累积超限 → 丢弃
+                    }
+                    frame_buffer_.insert(frame_buffer_.end(), data + 2, data + len);
+                }
+            }
+        } else {
+            // H.265
+            if (len < 2) return;
+            uint8_t nal_type = (data[0] >> 1) & 0x3F;
+            if (nal_type != 49 && nal_type != 48 && nal_type != 50) {
+                appendAnnexBNalu(data, len);
+                if (isH265Irap(nal_type)) frame_is_idr_ = true;
+            } else if (nal_type == 48) {
+                // AP: [payload hdr(2)][nalu_size(2)][nalu]...
+                size_t off = 2;
+                while (off + 2 <= len) {
+                    uint16_t nalu_size = static_cast<uint16_t>((data[off] << 8) | data[off + 1]);
+                    off += 2;
+                    if (nalu_size == 0 || off + nalu_size > len) {
+                        break;
+                    }
+                    uint8_t inner_type = (data[off] >> 1) & 0x3F;
+                    appendAnnexBNalu(data + off, nalu_size);
+                    if (isH265Irap(inner_type)) frame_is_idr_ = true;
+                    off += nalu_size;
+                }
+            } else if (nal_type == 49 && len >= 3) {
+                uint8_t fu_indicator0 = data[0];
+                uint8_t fu_indicator1 = data[1];
+                uint8_t fu_header = data[2];
+                bool start = (fu_header & 0x80) != 0;
+                bool end = (fu_header & 0x40) != 0;
+                uint8_t orig_type = fu_header & 0x3F;
+                uint8_t orig0 = (fu_indicator0 & 0x81) | (orig_type << 1);
+                uint8_t orig1 = fu_indicator1;
+                if (start) {
+                    h265_fu_drop_mode_ = false;
+                    h265_fu_in_progress_ = true;
+                    h265_fu_start_offset_ = frame_buffer_.size();
+                    static const uint8_t start_code[] = {0x00, 0x00, 0x00, 0x01};
+                    frame_buffer_.insert(frame_buffer_.end(), start_code, start_code + 4);
+                    frame_buffer_.push_back(orig0);
+                    frame_buffer_.push_back(orig1);
+                    if (isH265Irap(orig_type)) frame_is_idr_ = true;
+                } else if (h265_fu_drop_mode_ || !h265_fu_in_progress_) {
+                    return;
+                }
+                if (len > 3 && !h265_fu_drop_mode_) {
+                    if (frame_buffer_.size() + (len - 3) > kMaxAssembledFrameBytes) {
+                        h265_fu_drop_mode_ = true; clearCurrentFrameState(); return;  // 累积超限 → 丢弃
+                    }
+                    frame_buffer_.insert(frame_buffer_.end(), data + 3, data + len);
+                }
+                if (end && h265_fu_in_progress_) {
+                    h265_fu_in_progress_ = false;
+                }
+            }
+        }
+
+        if (marker) {
+            if (codec_ == CodecType::H265 && h265_fu_drop_mode_) {
+                clearCurrentFrameState();
+                h265_fu_drop_mode_ = false;
+                h265_fu_in_progress_ = false;
+                return;
+            }
+            emitFrame(timestamp);
+        }
+    }
+
+private:
+    Socket rtp_socket_;
+    Socket rtcp_socket_;
+    uint16_t rtp_port_ = 0;
+    uint16_t rtcp_port_ = 0;
+    std::atomic<bool> running_{false};
+    std::thread receive_thread_;
+    FrameCallback callback_;
+
+    CodecType codec_ = CodecType::H264;
+    uint8_t payload_type_ = 96;
+    uint32_t width_ = 1920;
+    uint32_t height_ = 1080;
+    uint32_t fps_ = 30;
+
+    std::vector<uint8_t> frame_buffer_;
+    uint32_t frame_ts_ = 0;
+    bool frame_in_progress_ = false;
+    bool frame_is_idr_ = false;
+    bool seq_initialized_ = false;
+    uint16_t last_seq_ = 0;
+    bool h265_fu_in_progress_ = false;
+    bool h265_fu_drop_mode_ = false;
+    size_t h265_fu_start_offset_ = 0;
+    uint32_t jitter_buffer_packets_ = 32;
+    std::map<uint16_t, std::vector<uint8_t>> reorder_buffer_;
+    bool reorder_initialized_ = false;
+    uint16_t expected_seq_ = 0;
+    std::atomic<uint64_t> packets_received_{0};
+    std::atomic<uint64_t> packets_reordered_{0};
+    std::atomic<uint64_t> packet_loss_events_{0};
+    std::atomic<uint64_t> frames_output_{0};
+};
+
+// RtspClient::Impl 定义
+class RtspClient::Impl {
+public:
+    enum class ClientState {
+        Idle,
+        Opened,
+        Described,
+        Setup,
+        Playing,
+        Closing,
+        Closed
+    };
+
+    RtspClientConfig config_;
+    std::unique_ptr<Socket> control_socket_;
+    std::unique_ptr<RtpReceiver> rtp_receiver_;
+    
+    std::string server_url_;
+    std::string request_url_;
+    std::string server_host_;
+    uint16_t server_port_ = 554;
+    std::string server_path_;
+    std::string setup_control_url_;
+    // 来自 DESCRIBE 响应的 Content-Base / Content-Location（RFC2326 / RFC7826 行为）：
+    // 相对 a=control 的解析基准。若 server 未给，则回退到 request_url_。
+    std::string content_base_;
+    std::string auth_user_;
+    std::string auth_pass_;
+    std::string basic_auth_header_;
+    bool use_digest_auth_ = false;
+    std::string digest_realm_;
+    std::string digest_nonce_;
+    std::string digest_qop_;
+    uint32_t digest_nc_ = 0;
+    bool use_tcp_transport_ = false;
+    uint8_t interleaved_rtp_channel_ = 0;
+    uint8_t interleaved_rtcp_channel_ = 1;
+
+    SessionInfo session_info_;
+    int cseq_ = 0;
+    std::string session_id_;
+    bool connected_ = false;
+    bool playing_ = false;
+    bool receiver_started_ = false;
+    std::atomic<bool> stop_waiting_{false};
+    std::atomic<ClientState> state_{ClientState::Idle};
+    std::thread tcp_receive_thread_;
+    std::atomic<bool> tcp_receive_running_{false};
+    std::atomic<uint64_t> auth_retries_{0};
+    
+    FrameCallback frame_callback_;
+    ErrorCallback error_callback_;
+    
+    std::queue<VideoFrame> frame_queue_;
+    std::mutex queue_mutex_;
+    std::condition_variable queue_cv_;
+
+    bool isClosing() const {
+        return state_.load() == ClientState::Closing;
+    }
+
+    void setState(ClientState st) {
+        state_.store(st);
+    }
+
+    void wakeFrameWaiters() {
+        stop_waiting_ = true;
+        queue_cv_.notify_all();
+    }
+
+    void wakeStopWaiters() {
+        wakeFrameWaiters();
+        if (control_socket_) {
+            control_socket_->shutdownReadWrite();
+        }
+    }
+
+    bool parseUrl(const std::string& url) {
+        if (url.find("rtsp://") != 0) {
+            return false;
+        }
+
+        std::string no_scheme = url.substr(7);
+        size_t at_pos = no_scheme.find('@');
+        std::string host_part = no_scheme;
+        if (at_pos != std::string::npos) {
+            std::string userinfo = no_scheme.substr(0, at_pos);
+            host_part = no_scheme.substr(at_pos + 1);
+            size_t colon = userinfo.find(':');
+            if (colon != std::string::npos) {
+                auth_user_ = userinfo.substr(0, colon);
+                auth_pass_ = userinfo.substr(colon + 1);
+            } else {
+                auth_user_ = userinfo;
+                auth_pass_.clear();
+            }
+        }
+
+        size_t slash_pos = host_part.find('/');
+        std::string host_port = slash_pos == std::string::npos ? host_part : host_part.substr(0, slash_pos);
+        server_path_ = slash_pos == std::string::npos ? "/" : host_part.substr(slash_pos);
+        if (server_path_.empty()) server_path_ = "/";
+
+        size_t colon_pos = host_port.find(':');
+        if (colon_pos != std::string::npos) {
+            server_host_ = host_port.substr(0, colon_pos);
+            uint32_t p = 0;
+            if (!parseUint32Safe(host_port.substr(colon_pos + 1), p) || p == 0 || p > 65535) {
+                return false;
+            }
+            server_port_ = static_cast<uint16_t>(p);
+        } else {
+            server_host_ = host_port;
+            server_port_ = 554;
+        }
+        if (server_host_.empty()) return false;
+
+        request_url_ = "rtsp://" + server_host_ + ":" + std::to_string(server_port_) + server_path_;
+        server_url_ = request_url_;
+        if (!auth_user_.empty()) {
+            std::string token = auth_user_ + ":" + auth_pass_;
+            basic_auth_header_ = "Basic " + base64Encode(reinterpret_cast<const uint8_t*>(token.data()), token.size());
+        } else {
+            basic_auth_header_.clear();
+        }
+        
+        return true;
+    }
+
+    void appendCommonHeaders(std::ostringstream& request, const std::string& method = "",
+                             const std::string& uri = "") {
+        request << "User-Agent: " << config_.user_agent << "\r\n";
+        if (use_digest_auth_ && !method.empty() && !uri.empty()) {
+            std::string digest = buildDigestAuthorization(method, uri);
+            if (!digest.empty()) {
+                request << "Authorization: " << digest << "\r\n";
+                return;
+            }
+        }
+        if (!basic_auth_header_.empty()) {
+            request << "Authorization: " << basic_auth_header_ << "\r\n";
+        }
+    }
+
+    bool stopTcpReceiverThread(uint32_t timeout_ms, bool interrupt_control_socket) {
+        tcp_receive_running_ = false;
+        if (interrupt_control_socket && control_socket_) {
+            control_socket_->shutdownReadWrite();
+        }
+        queue_cv_.notify_all();
+        return joinThreadWithTimeout(tcp_receive_thread_, timeout_ms);
+    }
+
+    bool recvExact(uint8_t* out, size_t n, int timeout_ms) {
+        size_t off = 0;
+        while (off < n && tcp_receive_running_) {
+            ssize_t r = control_socket_->recv(out + off, n - off, timeout_ms);
+            if (r > 0) {
+                off += static_cast<size_t>(r);
+            } else if (r == 0) {
+                // Peer closed.
+                return false;
+            } else {
+                // Timeout or transient error.
+                continue;
+            }
+        }
+        return off == n;
+    }
+
+    void tcpReceiveLoop() {
+        while (tcp_receive_running_) {
+            uint8_t b = 0;
+            if (!recvExact(&b, 1, 200)) {
+                continue;
+            }
+            if (b != '$') {
+                continue;
+            }
+            uint8_t hdr[3];
+            if (!recvExact(hdr, 3, 200)) {
+                continue;
+            }
+            uint8_t channel = hdr[0];
+            uint16_t size = static_cast<uint16_t>((hdr[1] << 8) | hdr[2]);
+            if (size == 0) {
+                continue;
+            }
+            std::vector<uint8_t> payload(size);
+            if (!recvExact(payload.data(), payload.size(), 200)) {
+                continue;
+            }
+            if (channel == interleaved_rtp_channel_ && rtp_receiver_) {
+                rtp_receiver_->ingestRtpPacket(payload.data(), payload.size());
+            }
+        }
+    }
+
+    bool parseSdp(const std::string& sdp) {
+        session_info_.media_streams.clear();
+        
+        std::istringstream stream(sdp);
+        std::string line;
+        MediaInfo* current_media = nullptr;
+        
+        while (std::getline(stream, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            
+            if (line.find("m=video") == 0) {
+                session_info_.has_video = true;
+                session_info_.media_streams.emplace_back();
+                current_media = &session_info_.media_streams.back();
+
+                std::istringstream iss(line);
+                std::string type, port, proto, pt;
+                iss >> type >> port >> proto >> pt;
+                uint32_t pt_v = 0;
+                if (parseUint32Safe(pt, pt_v) && pt_v <= 127) {
+                    current_media->payload_type = static_cast<int>(pt_v);
+                }
+            } else if (line.rfind("m=", 0) == 0) {
+                // Only parse attributes for the currently active video media section.
+                // When another media section starts (e.g. audio), stop mutating video fields.
+                current_media = nullptr;
+            }
+            else if (line.find("a=rtpmap:") == 0 && current_media) {
+                // static const 避免每次构造触发 libstdc++ ctype narrow 缓存竞争
+                static const std::regex rtpmap_regex("a=rtpmap:(\\d+)\\s+(\\w+)/(\\d+)");
+                std::smatch match;
+                if (std::regex_search(line, match, rtpmap_regex)) {
+                    current_media->codec_name = match[2];
+                    uint32_t rate = 0;
+                    if (parseUint32Safe(match[3].str(), rate)) {
+                        current_media->clock_rate = static_cast<int>(rate);
+                    }
+
+                    if (current_media->codec_name.find("264") != std::string::npos) {
+                        current_media->codec = CodecType::H264;
+                    } else if (current_media->codec_name.find("265") != std::string::npos ||
+                               current_media->codec_name.find("HEVC") != std::string::npos) {
+                        current_media->codec = CodecType::H265;
+                    }
+                }
+            }
+            else if (line.find("a=control:") == 0 && current_media) {
+                current_media->control_url = line.substr(10);
+            }
+            else if (line.find("a=framesize:") == 0 && current_media) {
+                static const std::regex size_regex("a=framesize:(\\d+)\\s+(\\d+)-(\\d+)");
+                std::smatch match;
+                if (std::regex_search(line, match, size_regex)) {
+                    uint32_t w = 0, h = 0;
+                    if (parseUint32Safe(match[2].str(), w) &&
+                        parseUint32Safe(match[3].str(), h)) {
+                        current_media->width = w;
+                        current_media->height = h;
+                    }
+                }
+            }
+            else if (line.find("a=cliprect:") == 0 && current_media) {
+                static const std::regex clip_regex("a=cliprect:\\d+,\\d+,(\\d+),(\\d+)");
+                std::smatch match;
+                if (std::regex_search(line, match, clip_regex)) {
+                    uint32_t h = 0, w = 0;
+                    if (parseUint32Safe(match[1].str(), h) &&
+                        parseUint32Safe(match[2].str(), w) && w > 0 && h > 0) {
+                        current_media->width = w;
+                        current_media->height = h;
+                    }
+                }
+            }
+            else if (line.find("a=framerate:") == 0 && current_media) {
+                static const std::regex fr_regex("a=framerate:(\\d+(?:\\.\\d+)?)");
+                std::smatch match;
+                if (std::regex_search(line, match, fr_regex)) {
+                    try {
+                        double fps_d = std::stod(match[1]);
+                        if (fps_d > 0 && fps_d < 1e6) {
+                            current_media->fps = static_cast<uint32_t>(fps_d);
+                        }
+                    } catch (...) {
+                        // 忽略畸形帧率字符串
+                    }
+                }
+            }
+            else if (line.find("a=fmtp:") == 0 && current_media) {
+                std::smatch match;
+                static const std::regex h264_sprop("sprop-parameter-sets=([^;\\s]+)");
+                if (std::regex_search(line, match, h264_sprop)) {
+                    std::string sprops = match[1].str();
+                    size_t comma = sprops.find(',');
+                    if (comma != std::string::npos) {
+                        current_media->sps = base64Decode(sprops.substr(0, comma));
+                        current_media->pps = base64Decode(sprops.substr(comma + 1));
+                    }
+                }
+                static const std::regex h265_vps("sprop-vps=([^;\\s]+)");
+                if (std::regex_search(line, match, h265_vps)) {
+                    current_media->vps = base64Decode(match[1].str());
+                }
+                static const std::regex h265_sps("sprop-sps=([^;\\s]+)");
+                if (std::regex_search(line, match, h265_sps)) {
+                    current_media->sps = base64Decode(match[1].str());
+                }
+                static const std::regex h265_pps("sprop-pps=([^;\\s]+)");
+                if (std::regex_search(line, match, h265_pps)) {
+                    current_media->pps = base64Decode(match[1].str());
+                }
+            }
+        }
+
+        for (auto& media : session_info_.media_streams) {
+            if (media.width == 0) media.width = 1920;
+            if (media.height == 0) media.height = 1080;
+            if (media.fps == 0) media.fps = 30;
+            if (media.clock_rate == 0) media.clock_rate = 90000;
+            if (media.payload_type == 0) {
+                media.payload_type = (media.codec == CodecType::H265) ? 97 : 96;
+            }
+        }
+        return true;
+    }
+
+    bool sendRequest(const std::string& method, const std::string& uri,
+                     const std::string& extra_headers, const std::string& body,
+                     std::string& response, bool allow_retry_401 = true,
+                     int recv_timeout_ms = 5000) {
+        auto send_once = [&](bool with_auth) -> bool {
+            std::ostringstream req;
+            req << method << " " << uri << " RTSP/1.0\r\n";
+            req << "CSeq: " << ++cseq_ << "\r\n";
+            if (!extra_headers.empty()) req << extra_headers;
+            if (!body.empty()) {
+                req << "Content-Length: " << body.size() << "\r\n";
+            }
+            if (with_auth) {
+                appendCommonHeaders(req, method, uri);
+            } else {
+                req << "User-Agent: " << config_.user_agent << "\r\n";
+            }
+            req << "\r\n";
+            if (!body.empty()) req << body;
+
+            std::string req_str = req.str();
+            // 带写超时的全量发送：坏 peer 不读时，裸阻塞 send 会让 close()/teardown()
+            // 卡死超过契约超时。sendAll 在 recv_timeout_ms 内尽量发完，超时/错误返回非全长。
+            if (control_socket_->sendAll((const uint8_t*)req_str.c_str(), req_str.size(),
+                                         recv_timeout_ms) != static_cast<ssize_t>(req_str.size())) {
+                return false;
+            }
+            return recvRtspResponse(control_socket_.get(), &response, recv_timeout_ms);
+        };
+
+        if (!send_once(true)) return false;
+        if (response.find("401") != std::string::npos && allow_retry_401 && !auth_user_.empty()) {
+            if (parseWwwAuthenticate(response)) {
+                auth_retries_++;
+                return send_once(true);
+            }
+        }
+        return true;
+    }
+
+    static std::unordered_map<std::string, std::string> parseAuthParams(const std::string& value) {
+        std::unordered_map<std::string, std::string> kv;
+        size_t pos = 0;
+        while (pos < value.size()) {
+            while (pos < value.size() && (value[pos] == ' ' || value[pos] == ',')) pos++;
+            size_t eq = value.find('=', pos);
+            if (eq == std::string::npos) break;
+            std::string key = value.substr(pos, eq - pos);
+            pos = eq + 1;
+            std::string v;
+            if (pos < value.size() && value[pos] == '"') {
+                size_t endq = value.find('"', pos + 1);
+                if (endq == std::string::npos) break;
+                v = value.substr(pos + 1, endq - pos - 1);
+                pos = endq + 1;
+            } else {
+                size_t comma = value.find(',', pos);
+                if (comma == std::string::npos) {
+                    v = value.substr(pos);
+                    pos = value.size();
+                } else {
+                    v = value.substr(pos, comma - pos);
+                    pos = comma + 1;
+                }
+            }
+            kv[key] = v;
+        }
+        return kv;
+    }
+
+    bool parseWwwAuthenticate(const std::string& response) {
+        static const std::regex ww_re("WWW-Authenticate:\\s*([^\\r\\n]+)", std::regex::icase);
+        std::smatch m;
+        if (!std::regex_search(response, m, ww_re)) {
+            return false;
+        }
+        std::string challenge = m[1].str();
+        if (challenge.rfind("Digest ", 0) == 0) {
+            auto p = parseAuthParams(challenge.substr(7));
+            digest_realm_ = p["realm"];
+            digest_nonce_ = p["nonce"];
+            digest_qop_.clear();
+            if (!p["qop"].empty()) {
+                // qop can be a comma-separated list like "auth,auth-int". Pick a supported token.
+                std::string qop_list = p["qop"];
+                std::vector<std::string> tokens;
+                std::size_t pos = 0;
+                while (pos < qop_list.size()) {
+                    const auto comma = qop_list.find(',', pos);
+                    const auto end = comma == std::string::npos ? qop_list.size() : comma;
+                    std::string tok = qop_list.substr(pos, end - pos);
+                    // trim spaces
+                    while (!tok.empty() && std::isspace(static_cast<unsigned char>(tok.front()))) tok.erase(tok.begin());
+                    while (!tok.empty() && std::isspace(static_cast<unsigned char>(tok.back()))) tok.pop_back();
+                    if (!tok.empty()) tokens.push_back(tok);
+                    if (comma == std::string::npos) break;
+                    pos = comma + 1;
+                }
+                for (const auto& t : tokens) {
+                    if (t == "auth") {
+                        digest_qop_ = "auth";
+                        break;
+                    }
+                }
+                if (digest_qop_.empty() && !tokens.empty()) {
+                    digest_qop_ = tokens.front();
+                }
+            }
+            use_digest_auth_ = !digest_realm_.empty() && !digest_nonce_.empty();
+            return use_digest_auth_;
+        }
+        if (challenge.rfind("Basic ", 0) == 0) {
+            use_digest_auth_ = false;
+            return !basic_auth_header_.empty();
+        }
+        return false;
+    }
+
+    std::string buildDigestAuthorization(const std::string& method, const std::string& uri) {
+        if (auth_user_.empty() || auth_pass_.empty() || digest_nonce_.empty() || digest_realm_.empty()) {
+            return "";
+        }
+        std::string ha1 = md5Hex(auth_user_ + ":" + digest_realm_ + ":" + auth_pass_);
+        std::string ha2 = md5Hex(method + ":" + uri);
+        std::string response;
+        std::string nc;
+        std::string cnonce;
+        if (digest_qop_.empty()) {
+            // RFC 2069 style (no qop): response = MD5(HA1:nonce:HA2)
+            response = md5Hex(ha1 + ":" + digest_nonce_ + ":" + ha2);
+        } else {
+            // RFC 2617 style (with qop): response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+            digest_nc_++;
+            std::stringstream nc_ss;
+            nc_ss << std::hex << std::setw(8) << std::setfill('0') << digest_nc_;
+            nc = nc_ss.str();
+            cnonce = md5Hex(std::to_string(digest_nc_) + ":" + auth_user_ + ":" + uri).substr(0, 16);
+            response = md5Hex(ha1 + ":" + digest_nonce_ + ":" + nc + ":" + cnonce + ":" + digest_qop_ + ":" + ha2);
+        }
+
+        std::ostringstream out;
+        out << "Digest username=\"" << auth_user_ << "\", realm=\"" << digest_realm_
+            << "\", nonce=\"" << digest_nonce_ << "\", uri=\"" << uri
+            << "\", response=\"" << response << "\"";
+        if (!digest_qop_.empty()) {
+            out << ", qop=" << digest_qop_ << ", nc=" << nc << ", cnonce=\"" << cnonce << "\"";
+        }
+        return out.str();
+    }
+
+    void onFrame(const VideoFrame& frame) {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (frame_queue_.size() >= config_.buffer_size) {
+                auto& old = frame_queue_.front();
+                releaseFrameData(old);
+                frame_queue_.pop();
+            }
+            
+            VideoFrame copy = cloneFrameManaged(frame);
+            frame_queue_.push(copy);
+        }
+        queue_cv_.notify_one();
+
+        if (frame_callback_) {
+            frame_callback_(frame);
+        }
+    }
+};
+
+// RtspClient 实现
+RtspClient::RtspClient() : impl_(std::make_unique<Impl>()) {}
+
+RtspClient::~RtspClient() {
+    // Avoid noisy close logs when the client was never opened/connected.
+    if (impl_ && (impl_->connected_ || impl_->playing_)) {
+        close();
+    }
+}
+
+void RtspClient::setConfig(const RtspClientConfig& config) {
+    impl_->config_ = config;
+}
+
+bool RtspClient::open(const std::string& url) {
+    auto st = impl_->state_.load();
+    if (!(st == Impl::ClientState::Idle || st == Impl::ClientState::Closed)) {
+        return false;
+    }
+    if (!impl_->parseUrl(url)) {
+        return false;
+    }
+
+    impl_->control_socket_ = std::make_unique<Socket>();
+    if (!impl_->control_socket_->connect(impl_->server_host_, impl_->server_port_, 10000)) {
+        return false;
+    }
+
+    impl_->connected_ = true;
+    impl_->stop_waiting_ = false;
+    impl_->setState(Impl::ClientState::Opened);
+    return true;
+}
+
+bool RtspClient::describe() {
+    if (impl_->isClosing()) return false;
+    if (!impl_->connected_) return false;
+    std::string response;
+    if (!impl_->sendRequest("DESCRIBE", impl_->request_url_,
+                            "Accept: application/sdp\r\n", "", response)) {
+        return false;
+    }
+
+    if (response.find("200 OK") == std::string::npos) {
+        return false;
+    }
+
+    size_t sdp_start = response.find("\r\n\r\n");
+    if (sdp_start == std::string::npos) return false;
+
+    // 解析 Content-Base / Content-Location，用于 SETUP 中拼相对 control URL
+    // 用手写 case-insensitive 搜索而非 std::regex：
+    //  1. 避免 libstdc++ regex 构造器的 std::ctype 内部缓存在 TSan 下误报竞争
+    //  2. 性能更好（每个 DESCRIBE 都要解析）
+    {
+        const std::string headers = response.substr(0, sdp_start);
+        std::string headers_lc;
+        headers_lc.reserve(headers.size());
+        for (char c : headers) headers_lc.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+
+        auto extractHeader = [&](const std::string& lc_key) -> std::string {
+            size_t p = headers_lc.find(lc_key);
+            if (p == std::string::npos) return {};
+            p += lc_key.size();
+            while (p < headers.size() && (headers[p] == ' ' || headers[p] == '\t')) ++p;
+            size_t end = headers.find("\r\n", p);
+            if (end == std::string::npos) end = headers.size();
+            std::string v = headers.substr(p, end - p);
+            while (!v.empty() && std::isspace(static_cast<unsigned char>(v.back()))) v.pop_back();
+            return v;
+        };
+        std::string cb = extractHeader("content-base:");
+        if (cb.empty()) cb = extractHeader("content-location:");
+        impl_->content_base_ = cb;
+    }
+
+    std::string sdp = response.substr(sdp_start + 4);
+    bool ok = impl_->parseSdp(sdp);
+    if (ok) {
+        impl_->setState(Impl::ClientState::Described);
+    }
+    return ok;
+}
+
+SessionInfo RtspClient::getSessionInfo() const {
+    return impl_->session_info_;
+}
+
+void RtspClient::setFrameCallback(FrameCallback callback) {
+    impl_->frame_callback_ = callback;
+}
+
+void RtspClient::setErrorCallback(ErrorCallback callback) {
+    impl_->error_callback_ = callback;
+}
+
+bool RtspClient::setup(int stream_index) {
+    if (impl_->isClosing()) return false;
+    if (!impl_->connected_) return false;
+    if (stream_index >= (int)impl_->session_info_.media_streams.size()) return false;
+
+    auto& media = impl_->session_info_.media_streams[stream_index];
+
+    // control URL 解析优先级：
+    // 1. 绝对 URL（rtsp://...）直接用
+    // 2. control 是 "*" 表示聚合会话，使用 content_base 或 request_url
+    // 3. 相对路径：用 Content-Base（DESCRIBE 响应给的）作为基准；否则用 request_url
+    // 规则对齐 RFC2326/RFC7826，以解决 VLC / 老 live555 在相对 control 上的不一致
+    std::string control_url = media.control_url;
+    if (control_url == "*") {
+        control_url = !impl_->content_base_.empty() ? impl_->content_base_ : impl_->request_url_;
+    } else if (control_url.find("rtsp://") != 0) {
+        // 相对路径，取 base
+        std::string base = !impl_->content_base_.empty() ? impl_->content_base_ : impl_->request_url_;
+        if (control_url.empty()) {
+            control_url = base;
+        } else if (base.empty()) {
+            control_url = control_url;
+        } else if (control_url.front() == '/') {
+            // control 已以 / 开头，相对 host 基根（罕见）：取 base 的 scheme+host 部分
+            size_t scheme_end = base.find("://");
+            if (scheme_end != std::string::npos) {
+                size_t path_start = base.find('/', scheme_end + 3);
+                std::string origin = (path_start == std::string::npos) ? base : base.substr(0, path_start);
+                control_url = origin + control_url;
+            } else {
+                control_url = base + control_url;
+            }
+        } else {
+            // 纯相对：去掉 base 最末的 / 后（若有），拼 '/' + control
+            if (!base.empty() && base.back() == '/') {
+                control_url = base + control_url;
+            } else {
+                control_url = base + "/" + control_url;
+            }
+        }
+    }
+    auto do_setup = [&](bool use_tcp, std::string& response_out) -> bool {
+        uint16_t selected_rtp_port = 0;
+        if (use_tcp) {
+            impl_->rtp_receiver_ = std::make_unique<RtpReceiver>();
+            impl_->rtp_receiver_->setJitterBufferPackets(impl_->config_.jitter_buffer_packets);
+        } else {
+            bool bound = false;
+            uint32_t start = impl_->config_.rtp_port_start;
+            uint32_t end = impl_->config_.rtp_port_end;
+            if (end <= start + 1) {
+                end = start + 64;
+            }
+            for (uint32_t p = start; p + 1 < end; p += 2) {
+                auto candidate = std::make_unique<RtpReceiver>();
+                candidate->setJitterBufferPackets(impl_->config_.jitter_buffer_packets);
+                if (candidate->init(static_cast<uint16_t>(p), static_cast<uint16_t>(p + 1))) {
+                    selected_rtp_port = static_cast<uint16_t>(p);
+                    impl_->rtp_receiver_ = std::move(candidate);
+                    bound = true;
+                    break;
+                }
+            }
+            if (!bound) {
+                return false;
+            }
+        }
+
+        std::ostringstream request;
+        request.clear();
+        if (use_tcp) {
+            request << "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n";
+        } else {
+            request << "Transport: RTP/AVP;unicast;client_port="
+                    << selected_rtp_port << "-" << (selected_rtp_port + 1) << "\r\n";
+        }
+        if (!impl_->sendRequest("SETUP", control_url, request.str(), "", response_out)) {
+            return false;
+        }
+        if (response_out.find("200 OK") == std::string::npos) {
+            return false;
+        }
+        return true;
+    };
+
+    std::string response;
+    bool use_tcp = impl_->config_.prefer_tcp_transport;
+    bool ok = do_setup(use_tcp, response);
+    if (!ok && impl_->config_.fallback_to_tcp) {
+        const bool udp_can_fallback = response.empty() ||
+            responseHasStatusCode(response, 400) ||
+            responseHasStatusCode(response, 461) ||
+            responseHasStatusCode(response, 500) ||
+            responseHasStatusCode(response, 503);
+        const bool tcp_can_fallback = responseHasStatusCode(response, 400) ||
+            responseHasStatusCode(response, 461);
+        if (!use_tcp && udp_can_fallback) {
+            use_tcp = true;
+            ok = do_setup(use_tcp, response);
+        } else if (use_tcp && tcp_can_fallback) {
+            use_tcp = false;
+            ok = do_setup(use_tcp, response);
+        }
+    }
+    if (!ok) return false;
+    impl_->use_tcp_transport_ = use_tcp;
+
+    static const std::regex session_regex("Session:\\s*([^;\\r\\n]+)");
+    std::smatch match;
+    if (std::regex_search(response, match, session_regex)) {
+        impl_->session_id_ = match[1];
+    }
+    if (impl_->use_tcp_transport_) {
+        static const std::regex interleaved_regex("interleaved=(\\d+)-(\\d+)", std::regex::icase);
+        std::smatch tm;
+        if (std::regex_search(response, tm, interleaved_regex)) {
+            uint32_t rtp_ch = 0, rtcp_ch = 0;
+            if (parseUint32Safe(tm[1].str(), rtp_ch) && rtp_ch <= 255) {
+                impl_->interleaved_rtp_channel_ = static_cast<uint8_t>(rtp_ch);
+            }
+            if (parseUint32Safe(tm[2].str(), rtcp_ch) && rtcp_ch <= 255) {
+                impl_->interleaved_rtcp_channel_ = static_cast<uint8_t>(rtcp_ch);
+            }
+        }
+    }
+    impl_->rtp_receiver_->setVideoInfo(media.codec, media.width, media.height, media.fps, static_cast<uint8_t>(media.payload_type));
+    impl_->rtp_receiver_->setCallback([this](const VideoFrame& frame) {
+        impl_->onFrame(frame);
+    });
+    impl_->setup_control_url_ = control_url;
+
+    impl_->setState(Impl::ClientState::Setup);
+    return true;
+}
+
+bool RtspClient::play(uint64_t start_time_ms) {
+    if (impl_->isClosing()) return false;
+    if (!impl_->connected_ || impl_->session_id_.empty()) return false;
+    const std::string play_url_primary = impl_->request_url_;
+    const bool has_secondary_url =
+        !impl_->setup_control_url_.empty() && impl_->setup_control_url_ != play_url_primary;
+
+    std::ostringstream extra;
+    extra << "Session: " << impl_->session_id_ << "\r\n";
+    if (start_time_ms > 0) {
+        extra << "Range: npt=" << (start_time_ms / 1000.0) << "-\r\n";
+    }
+    std::string response_primary;
+    bool play_ok = impl_->sendRequest("PLAY", play_url_primary, extra.str(), "", response_primary) &&
+                   response_primary.find("200 OK") != std::string::npos;
+
+    if (!play_ok && has_secondary_url) {
+        std::string response_secondary;
+        play_ok = impl_->sendRequest("PLAY", impl_->setup_control_url_, extra.str(), "", response_secondary) &&
+                  response_secondary.find("200 OK") != std::string::npos;
+    }
+    if (!play_ok) {
+        return false;
+    }
+
+    impl_->playing_ = true;
+    impl_->stop_waiting_ = false;
+    impl_->setState(Impl::ClientState::Playing);
+    if (impl_->rtp_receiver_ && !impl_->receiver_started_) {
+        if (impl_->use_tcp_transport_) {
+            impl_->tcp_receive_running_ = true;
+            impl_->tcp_receive_thread_ = std::thread([this]() {
+                impl_->tcpReceiveLoop();
+            });
+        } else {
+            impl_->rtp_receiver_->start();
+        }
+        impl_->receiver_started_ = true;
+    }
+    return true;
+}
+
+bool RtspClient::pause() {
+    if (impl_->isClosing()) return false;
+    if (!impl_->connected_ || impl_->session_id_.empty()) return false;
+
+    if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
+        if (!impl_->stopTcpReceiverThread(1000, false)) {
+            RTSP_LOG_ERROR("pause timeout: tcp_receive_thread still alive");
+        }
+        impl_->receiver_started_ = false;
+    }
+
+    std::ostringstream extra;
+    extra << "Session: " << impl_->session_id_ << "\r\n";
+    std::string response;
+    bool ok = impl_->sendRequest("PAUSE", impl_->request_url_, extra.str(), "", response);
+    
+    impl_->playing_ = false;
+    impl_->wakeFrameWaiters();
+    if (!impl_->use_tcp_transport_ && impl_->rtp_receiver_ && impl_->receiver_started_) {
+        impl_->rtp_receiver_->stop();
+        impl_->receiver_started_ = false;
+    }
+    if (ok && response.find("200 OK") != std::string::npos) {
+        impl_->setState(Impl::ClientState::Setup);
+        return true;
+    }
+    return false;
+}
+
+bool RtspClient::teardown() {
+    if (impl_->isClosing()) return false;
+    if (!impl_->connected_ || impl_->session_id_.empty()) return false;
+
+    if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
+        if (!impl_->stopTcpReceiverThread(1000, false)) {
+            RTSP_LOG_ERROR("teardown timeout: tcp_receive_thread still alive");
+        }
+        impl_->receiver_started_ = false;
+    }
+
+    std::ostringstream extra;
+    extra << "Session: " << impl_->session_id_ << "\r\n";
+    std::string response;
+    impl_->sendRequest("TEARDOWN", impl_->request_url_, extra.str(), "", response, false);
+
+    impl_->playing_ = false;
+    impl_->wakeFrameWaiters();
+    impl_->session_id_.clear();
+    impl_->setup_control_url_.clear();
+    
+    if (impl_->rtp_receiver_) {
+        impl_->rtp_receiver_->stop();
+        impl_->receiver_started_ = false;
+    }
+    impl_->setState(Impl::ClientState::Opened);
+    return true;
+}
+
+void RtspClient::receiveLoop() {
+    std::unique_lock<std::mutex> lock(impl_->queue_mutex_);
+    while (!impl_->stop_waiting_ && impl_->playing_) {
+        impl_->queue_cv_.wait(lock, [this] {
+            return impl_->stop_waiting_ || !impl_->playing_ || !impl_->frame_queue_.empty();
+        });
+    }
+}
+
+bool RtspClient::receiveFrame(VideoFrame& frame, int timeout_ms) {
+    std::unique_lock<std::mutex> lock(impl_->queue_mutex_);
+    
+    if (!impl_->queue_cv_.wait_for(lock, std::chrono::milliseconds(timeout_ms),
+        [this] { return !impl_->frame_queue_.empty() || !impl_->playing_ || impl_->stop_waiting_; })) {
+        return false;
+    }
+
+    if (impl_->frame_queue_.empty()) return false;
+
+    frame = impl_->frame_queue_.front();
+    impl_->frame_queue_.pop();
+    return true;
+}
+
+bool RtspClient::isConnected() const {
+    return impl_->connected_;
+}
+
+bool RtspClient::isPlaying() const {
+    return impl_->playing_;
+}
+
+void RtspClient::close() {
+    (void)closeWithTimeout(2000);
+}
+
+bool RtspClient::closeWithTimeout(uint32_t timeout_ms) {
+    const auto begin = std::chrono::steady_clock::now();
+    RTSP_LOG_INFO("RtspClient close start, timeout_ms=" + std::to_string(timeout_ms));
+    impl_->setState(Impl::ClientState::Closing);
+    impl_->wakeFrameWaiters();
+    RTSP_LOG_INFO("RtspClient close wake signal sent (cv notify)");
+    impl_->playing_ = false;
+
+    const auto deadline = begin + std::chrono::milliseconds(timeout_ms);
+    auto remain_ms = [&]() -> uint32_t {
+        auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return 0;
+        return static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count());
+    };
+
+    bool ok = true;
+    if (impl_->connected_ && !impl_->session_id_.empty()) {
+        std::ostringstream extra;
+        extra << "Session: " << impl_->session_id_ << "\r\n";
+        std::string response;
+        impl_->sendRequest("TEARDOWN", impl_->request_url_, extra.str(), "", response, false,
+                           static_cast<int>(std::min<uint32_t>(remain_ms(), 150)));
+    }
+
+    if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (!impl_->stopTcpReceiverThread(remain_ms(), true)) {
+            ok = false;
+            RTSP_LOG_ERROR("RtspClient close timeout: tcp_receive_thread still alive (blocking: control_socket recv)");
+        } else {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            RTSP_LOG_INFO("RtspClient close tcp_receive_thread exited, elapsed_ms=" + std::to_string(ms));
+        }
+        impl_->receiver_started_ = false;
+    }
+
+    if (impl_->rtp_receiver_) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (!impl_->rtp_receiver_->stopWithTimeout(remain_ms())) {
+            ok = false;
+            RTSP_LOG_ERROR("RtspClient close timeout: rtp_receive_thread still alive (blocking: udp recvFrom)");
+        } else {
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            RTSP_LOG_INFO("RtspClient close rtp_receive_thread exited, elapsed_ms=" + std::to_string(ms));
+        }
+    }
+
+    if (impl_->control_socket_) {
+        impl_->control_socket_->shutdownReadWrite();
+        impl_->control_socket_->close();
+    }
+
+    impl_->connected_ = false;
+    impl_->playing_ = false;
+    impl_->receiver_started_ = false;
+    impl_->stop_waiting_ = true;
+    impl_->session_id_.clear();
+    impl_->setup_control_url_.clear();
+    {
+        std::lock_guard<std::mutex> lock(impl_->queue_mutex_);
+        while (!impl_->frame_queue_.empty()) {
+            auto& f = impl_->frame_queue_.front();
+            releaseFrameData(f);
+            impl_->frame_queue_.pop();
+        }
+    }
+    impl_->queue_cv_.notify_all();
+    impl_->setState(Impl::ClientState::Closed);
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - begin).count();
+    RTSP_LOG_INFO("RtspClient close done, elapsed_ms=" + std::to_string(elapsed));
+    return ok;
+}
+
+void RtspClient::interrupt() {
+    impl_->wakeStopWaiters();
+}
+
+bool RtspClient::sendOptions() {
+    if (impl_->isClosing()) return false;
+    if (!impl_->connected_) return false;
+    std::string response;
+    if (!impl_->sendRequest("OPTIONS", impl_->request_url_, "", "", response)) return false;
+    return response.find("200 OK") != std::string::npos;
+}
+
+bool RtspClient::sendGetParameter(const std::string& param) {
+    if (impl_->isClosing()) return false;
+    if (!impl_->connected_ || impl_->session_id_.empty()) return false;
+    bool restart_tcp_receiver = false;
+    if (impl_->use_tcp_transport_ && impl_->receiver_started_) {
+        if (!impl_->stopTcpReceiverThread(1000, false)) {
+            RTSP_LOG_ERROR("GET_PARAMETER timeout: tcp_receive_thread still alive");
+        }
+        impl_->receiver_started_ = false;
+        restart_tcp_receiver = impl_->playing_;
+    }
+
+    std::ostringstream extra;
+    extra << "Session: " << impl_->session_id_ << "\r\n";
+    extra << "Content-Type: text/parameters\r\n";
+    std::string response;
+    bool ok = impl_->sendRequest("GET_PARAMETER", impl_->request_url_, extra.str(), param, response);
+    if (restart_tcp_receiver && impl_->rtp_receiver_) {
+        impl_->tcp_receive_running_ = true;
+        impl_->tcp_receive_thread_ = std::thread([this]() {
+            impl_->tcpReceiveLoop();
+        });
+        impl_->receiver_started_ = true;
+    }
+    return ok && response.find("200 OK") != std::string::npos;
+}
+
+RtspClientStats RtspClient::getStats() const {
+    RtspClientStats s;
+    s.auth_retries = impl_->auth_retries_.load();
+    s.using_tcp_transport = impl_->use_tcp_transport_;
+    if (impl_->rtp_receiver_) {
+        auto rs = impl_->rtp_receiver_->getStats();
+        s.rtp_packets_received = rs.packets_received;
+        s.rtp_packets_reordered = rs.packets_reordered;
+        s.rtp_packet_loss_events = rs.packet_loss_events;
+        s.frames_output = rs.frames_output;
+    }
+    return s;
+}
+
+// SimpleRtspPlayer 实现
+SimpleRtspPlayer::SimpleRtspPlayer() = default;
+
+SimpleRtspPlayer::~SimpleRtspPlayer() {
+    close();
+}
+
+void SimpleRtspPlayer::setFrameCallback(FrameCallback callback) {
+    frame_callback_ = callback;
+}
+
+void SimpleRtspPlayer::setErrorCallback(ErrorCallback callback) {
+    error_callback_ = callback;
+}
+
+bool SimpleRtspPlayer::open(const std::string& url) {
+    client_ = std::make_unique<RtspClient>();
+    
+    // 设置错误回调
+    if (error_callback_) {
+        client_->setErrorCallback(error_callback_);
+    }
+    
+    if (!client_->open(url)) {
+        if (error_callback_) {
+            error_callback_("Failed to connect to: " + url);
+        }
+        return false;
+    }
+    
+    if (!client_->describe()) {
+        if (error_callback_) {
+            error_callback_("DESCRIBE failed");
+        }
+        return false;
+    }
+    
+    if (!client_->setup(0)) {
+        if (error_callback_) {
+            error_callback_("SETUP failed");
+        }
+        return false;
+    }
+    
+    // 设置帧回调 - 同时支持外部回调和内部缓存
+    client_->setFrameCallback([this](const VideoFrame& frame) {
+        // 1. 如果设置了外部回调，先调用外部回调
+        if (frame_callback_) {
+            frame_callback_(frame);
+        }
+        
+        // 2. 同时缓存到内部缓冲区，供 readFrame() 使用
+        {
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            if (frame_buffer_.size() < MAX_BUFFER_SIZE) {
+                VideoFrame copy = cloneFrameManaged(frame);
+                frame_buffer_.push_back(copy);
+            }
+            buffer_cv_.notify_one();
+        }
+    });
+
+    running_ = true;
+    receive_thread_ = std::thread([this]() {
+        if (!client_->play(0)) {
+            if (error_callback_) {
+                error_callback_("PLAY failed");
+            }
+            running_ = false;
+            return;
+        }
+        client_->receiveLoop();
+        running_ = false;
+        buffer_cv_.notify_all();
+    });
+
+    return true;
+}
+
+bool SimpleRtspPlayer::readFrame(VideoFrame& frame) {
+    std::unique_lock<std::mutex> lock(buffer_mutex_);
+    
+    buffer_cv_.wait(lock, [this] { 
+        return !frame_buffer_.empty() || !running_; 
+    });
+    
+    if (frame_buffer_.empty()) return false;
+    
+    frame = frame_buffer_.front();
+    frame_buffer_.erase(frame_buffer_.begin());
+    return true;
+}
+
+void SimpleRtspPlayer::close() {
+    (void)closeWithTimeout(2000);
+}
+
+bool SimpleRtspPlayer::closeWithTimeout(uint32_t timeout_ms) {
+    running_ = false;
+    buffer_cv_.notify_all();
+    
+    bool joined = joinThreadWithTimeout(receive_thread_, timeout_ms);
+    
+    if (client_) {
+        client_->closeWithTimeout(timeout_ms);
+    }
+    
+    for (auto& f : frame_buffer_) {
+        releaseFrameData(f);
+    }
+    frame_buffer_.clear();
+    return joined;
+}
+
+bool SimpleRtspPlayer::isRunning() const {
+    return running_;
+}
+
+bool SimpleRtspPlayer::getMediaInfo(uint32_t& width, uint32_t& height, uint32_t& fps, CodecType& codec) {
+    if (!client_) return false;
+    
+    auto info = client_->getSessionInfo();
+    if (info.media_streams.empty()) return false;
+    
+    auto& media = info.media_streams[0];
+    width = media.width;
+    height = media.height;
+    fps = media.fps;
+    codec = media.codec;
+    
+    return true;
+}
+
+} // namespace rtsp

@@ -1,0 +1,479 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include "ax_fs.hpp"
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "json.hpp"
+
+#include "common/ax_image.h"
+#include "common/ax_image_processor.h"
+#include "common/ax_system.h"
+#include "pipeline/ax_pipeline.h"
+
+namespace axpipeline {
+
+class ConfigLoader {
+public:
+    struct PipelineCfg {
+        std::string name;
+        std::int32_t device_id{-1};
+        axvsdk::pipeline::PipelineConfig sdk{};
+        // Max NPU processing FPS:
+        // - > 0: limit NPU processing rate (best-effort).
+        // - 0 or -1: no limit (disable limiter).
+        double npu_max_fps{0.0};
+        struct NpuCfg {
+            bool enable{false};
+            bool enable_osd{true};
+            // Enable ByteTrack object tracking on top of detector outputs.
+            // When enabled, OSD will be drawn from tracked boxes (stable IDs, per-ID colors).
+            bool enable_tracking{false};
+            // Track buffer in frames (roughly: how long a lost track is kept before removal).
+            std::int32_t track_buffer{30};
+            // Kalman-smooth the tracked OSD boxes per track_id (steadier boxes). Off by default.
+            bool kalman_smooth{false};
+            // Plugin .so path.
+            std::string ax_plugin_path;
+            // Plugin isolation mode:
+            // - "inproc": dlopen and run in current process (fastest, but plugin crash kills pipeline)
+            // - "process": run plugin in a subprocess (crash-isolated; may add copies/overhead)
+            std::string ax_plugin_isolation{"inproc"};
+            // Plugin init JSON string (the value of npu.ax_plugin_init_info dumped to a string).
+            std::string ax_plugin_init_json;
+        } npu{};
+        std::uint32_t log_every_n_frames{30};
+    };
+
+    struct AppCfg {
+        axvsdk::common::SystemOptions system{};
+        // Optional: AX_ENGINE virtual NPU mode (board/MSP only), passed via env.
+        // Supported values depend on SDK, typical: "disable" / "std" / "big_little" / "little_big".
+        std::string vnpu_mode;
+        std::vector<PipelineCfg> pipelines;
+    };
+
+    // system 段 → config 文件格式 JSON 文本(网页「导出配置」用,字段与 Load 的解析一一对应)
+    static std::string DumpSystemJsonText(const AppCfg& cfg) {
+        nlohmann::json s;
+        s["device_id"] = cfg.system.device_id;
+        s["enable_vdec"] = cfg.system.enable_vdec;
+        s["enable_venc"] = cfg.system.enable_venc;
+        s["enable_ivps"] = cfg.system.enable_ivps;
+        s["vdec_max_group_count"] = cfg.system.vdec_max_group_count;
+        s["venc_total_thread_num"] = cfg.system.venc_total_thread_num;
+        if (!cfg.vnpu_mode.empty()) s["vnpu_mode"] = cfg.vnpu_mode;
+        return s.dump();
+    }
+
+    // Parse a single pipeline object (same schema as pipelines[] entries in the config file).
+    // For HTTP/API usage: relative paths are kept as-is; callers may resolve them if needed.
+    static bool LoadPipelineFromJsonText(const std::string& text, PipelineCfg* out, std::string* error) {
+        if (out == nullptr) {
+            if (error) *error = "pipeline output is null";
+            return false;
+        }
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(text);
+        } catch (const std::exception& e) {
+            if (error) *error = std::string("json parse failed: ") + e.what();
+            return false;
+        }
+        return LoadPipelineFromJson(j, 0, out, error);
+    }
+
+    static bool LoadPipelineFromJson(const nlohmann::json& j, std::size_t index, PipelineCfg* out, std::string* error) {
+        if (out == nullptr) {
+            if (error) *error = "pipeline output is null";
+            return false;
+        }
+        if (!ParsePipeline(j, index, out)) {
+            if (error) *error = "invalid pipeline json";
+            return false;
+        }
+        return true;
+    }
+
+    // Parse a single output object (same schema as outputs[] entries in the config file).
+    static bool LoadOutputFromJsonText(const std::string& text,
+                                       axvsdk::pipeline::PipelineOutputConfig* out,
+                                       std::string* error) {
+        if (out == nullptr) {
+            if (error) *error = "output config is null";
+            return false;
+        }
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(text);
+        } catch (const std::exception& e) {
+            if (error) *error = std::string("json parse failed: ") + e.what();
+            return false;
+        }
+        return LoadOutputFromJson(j, out, error);
+    }
+
+    static bool LoadOutputFromJson(const nlohmann::json& j,
+                                   axvsdk::pipeline::PipelineOutputConfig* out,
+                                   std::string* error) {
+        if (out == nullptr) {
+            if (error) *error = "output config is null";
+            return false;
+        }
+        if (!ParseOutput(j, out)) {
+            if (error) *error = "invalid output json";
+            return false;
+        }
+        return true;
+    }
+
+    static bool LoadFromFile(const std::string& path, AppCfg* out, std::string* error) {
+        if (out == nullptr) {
+            if (error) *error = "config output is null";
+            return false;
+        }
+
+        std::string file_err;
+        const auto text = ReadFileToString(path, &file_err);
+        if (text.empty()) {
+            if (error) *error = file_err.empty() ? "empty config" : file_err;
+            return false;
+        }
+
+        json j;
+        try {
+            j = json::parse(text);
+        } catch (const std::exception& e) {
+            if (error) *error = std::string("json parse failed: ") + e.what();
+            return false;
+        }
+        if (!j.is_object()) {
+            if (error) *error = "config root must be object";
+            return false;
+        }
+
+        AppCfg cfg{};
+        const axfs::path base_dir = axfs::path(path).parent_path();
+        if (j.contains("system")) {
+            const auto& s = j["system"];
+            if (!s.is_object()) return false;
+            if (!GetOptI32(s, "device_id", &cfg.system.device_id)) return false;
+            if (!GetOptBool(s, "enable_vdec", &cfg.system.enable_vdec)) return false;
+            if (!GetOptBool(s, "enable_venc", &cfg.system.enable_venc)) return false;
+            if (!GetOptBool(s, "enable_ivps", &cfg.system.enable_ivps)) return false;
+            if (!GetOptU32(s, "vdec_max_group_count", &cfg.system.vdec_max_group_count)) return false;
+            if (!GetOptU32(s, "venc_total_thread_num", &cfg.system.venc_total_thread_num)) return false;
+            if (!GetOptString(s, "vnpu_mode", &cfg.vnpu_mode)) return false;
+        }
+
+        // pipelines 可为空数组:配合 --http_port,app 可零 pipeline 启动、全部在网页控制台上配置
+        if (!j.contains("pipelines") || !j["pipelines"].is_array()) {
+            if (error) *error = "missing pipelines[]";
+            return false;
+        }
+
+        const auto& arr = j["pipelines"];
+        cfg.pipelines.clear();
+        cfg.pipelines.reserve(arr.size());
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+            PipelineCfg p{};
+            if (!ParsePipeline(arr[i], i, &p)) {
+                if (error) *error = "invalid pipelines[" + std::to_string(i) + "]";
+                return false;
+            }
+            // Multi-card AXCL: a pipeline without an explicit device_id inherits the
+            // system one, so SDK modules and NPU plugins stay on the same card.
+            // (Otherwise plugins receive -1 and typically normalize it to card 0,
+            //  while VDEC/IVPS run on system.device_id -> cross-card garbage input.)
+            if (p.device_id < 0 && cfg.system.device_id >= 0) {
+                p.device_id = cfg.system.device_id;
+                p.sdk.device_id = cfg.system.device_id;
+            }
+            ResolvePathsRelativeToBase(base_dir, &p);
+            cfg.pipelines.push_back(std::move(p));
+        }
+
+        *out = std::move(cfg);
+        return true;
+    }
+
+private:
+    using json = nlohmann::json;
+
+    static void ResolvePathsRelativeToBase(const axfs::path& base_dir, PipelineCfg* cfg) {
+        if (cfg == nullptr) {
+            return;
+        }
+
+        auto resolve = [&](std::string* p) {
+            if (p == nullptr || p->empty()) return;
+            axfs::path pp(*p);
+            if (pp.is_relative() && !base_dir.empty()) {
+                *p = axfs_compat::LexicallyNormal(base_dir / pp).string();
+            }
+        };
+
+        resolve(&cfg->npu.ax_plugin_path);
+        if (!cfg->npu.ax_plugin_init_json.empty() && !base_dir.empty()) {
+            try {
+                auto j = json::parse(cfg->npu.ax_plugin_init_json);
+                if (j.is_object() && j.contains("model_path") && j["model_path"].is_string()) {
+                    std::string mp = j["model_path"].get<std::string>();
+                    axfs::path pp(mp);
+                    if (pp.is_relative()) {
+                        j["model_path"] = axfs_compat::LexicallyNormal(base_dir / pp).string();
+                        cfg->npu.ax_plugin_init_json = j.dump();
+                    }
+                }
+            } catch (...) {
+            }
+        }
+
+        // Input URI: resolve only for local-file inputs.
+        if (cfg->sdk.input.uri.rfind("rtsp://", 0) != 0 && cfg->sdk.input.uri.rfind("rtsps://", 0) != 0) {
+            resolve(&cfg->sdk.input.uri);
+        }
+
+        // Output URIs: resolve file targets; keep RTSP URIs unchanged.
+        for (auto& u : cfg->sdk.outputs) {
+            for (auto& uri : u.uris) {
+                if (uri.rfind("rtsp://", 0) == 0 || uri.rfind("rtsps://", 0) == 0) continue;
+                resolve(&uri);
+            }
+        }
+    }
+
+    static std::string ReadFileToString(const std::string& path, std::string* error) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file) {
+            if (error) *error = "failed to open file: " + path;
+            return {};
+        }
+        std::ostringstream oss;
+        oss << file.rdbuf();
+        return oss.str();
+    }
+
+    static bool GetOptBool(const json& j, const char* key, bool* out) {
+        if (!j.contains(key)) return true;
+        if (!j[key].is_boolean()) return false;
+        *out = j[key].get<bool>();
+        return true;
+    }
+
+    static bool GetOptI32(const json& j, const char* key, std::int32_t* out) {
+        if (!j.contains(key)) return true;
+        if (!j[key].is_number_integer()) return false;
+        *out = j[key].get<std::int32_t>();
+        return true;
+    }
+
+    static bool GetOptU32(const json& j, const char* key, std::uint32_t* out) {
+        if (!j.contains(key)) return true;
+        if (!j[key].is_number_unsigned() && !j[key].is_number_integer()) return false;
+        const auto v = j[key].get<std::int64_t>();
+        if (v < 0) return false;
+        *out = static_cast<std::uint32_t>(v);
+        return true;
+    }
+
+    static bool GetOptSizeT(const json& j, const char* key, std::size_t* out) {
+        if (!j.contains(key)) return true;
+        if (!j[key].is_number_unsigned() && !j[key].is_number_integer()) return false;
+        const auto v = j[key].get<std::int64_t>();
+        if (v < 0) return false;
+        *out = static_cast<std::size_t>(v);
+        return true;
+    }
+
+    static bool GetOptDouble(const json& j, const char* key, double* out) {
+        if (!j.contains(key)) return true;
+        if (!j[key].is_number()) return false;
+        *out = j[key].get<double>();
+        return true;
+    }
+
+    static bool GetOptString(const json& j, const char* key, std::string* out) {
+        if (!j.contains(key)) return true;
+        if (!j[key].is_string()) return false;
+        *out = j[key].get<std::string>();
+        return true;
+    }
+
+    static axvsdk::common::PixelFormat ParsePixelFormat(const std::string& s) {
+        if (s == "nv12" || s == "NV12") return axvsdk::common::PixelFormat::kNv12;
+        if (s == "rgb" || s == "RGB" || s == "rgb24" || s == "RGB24") return axvsdk::common::PixelFormat::kRgb24;
+        if (s == "bgr" || s == "BGR" || s == "bgr24" || s == "BGR24") return axvsdk::common::PixelFormat::kBgr24;
+        return axvsdk::common::PixelFormat::kUnknown;
+    }
+
+    static axvsdk::codec::VideoCodecType ParseVideoCodec(const std::string& s) {
+        if (s == "h264" || s == "H264") return axvsdk::codec::VideoCodecType::kH264;
+        if (s == "h265" || s == "H265" || s == "hevc" || s == "HEVC") return axvsdk::codec::VideoCodecType::kH265;
+        return axvsdk::codec::VideoCodecType::kUnknown;
+    }
+
+    static axvsdk::codec::QueueOverflowPolicy ParseOverflowPolicy(const std::string& s) {
+        if (s == "drop_newest") return axvsdk::codec::QueueOverflowPolicy::kDropNewest;
+        if (s == "block") return axvsdk::codec::QueueOverflowPolicy::kBlock;
+        return axvsdk::codec::QueueOverflowPolicy::kDropOldest;
+    }
+
+    static axvsdk::common::ResizeMode ParseResizeMode(const std::string& s) {
+        if (s == "keep_aspect" || s == "keep_aspect_ratio") return axvsdk::common::ResizeMode::kKeepAspectRatio;
+        return axvsdk::common::ResizeMode::kStretch;
+    }
+
+    static axvsdk::common::ResizeAlign ParseResizeAlign(const std::string& s) {
+        if (s == "start") return axvsdk::common::ResizeAlign::kStart;
+        if (s == "end") return axvsdk::common::ResizeAlign::kEnd;
+        return axvsdk::common::ResizeAlign::kCenter;
+    }
+
+    static bool ParseResizeOptions(const json& j, axvsdk::common::ResizeOptions* out) {
+        if (!out || !j.is_object()) return false;
+        std::string mode;
+        if (!GetOptString(j, "mode", &mode)) return false;
+        if (!mode.empty()) out->mode = ParseResizeMode(mode);
+
+        std::string h;
+        if (!GetOptString(j, "horizontal_align", &h)) return false;
+        if (!h.empty()) out->horizontal_align = ParseResizeAlign(h);
+
+        std::string v;
+        if (!GetOptString(j, "vertical_align", &v)) return false;
+        if (!v.empty()) out->vertical_align = ParseResizeAlign(v);
+
+        return GetOptU32(j, "background_color", &out->background_color);
+    }
+
+    static bool ParsePipeline(const json& j, std::size_t index, PipelineCfg* out) {
+        if (!out || !j.is_object()) return false;
+
+        if (!GetOptString(j, "name", &out->name)) return false;
+        if (out->name.empty()) out->name = "pipeline_" + std::to_string(index);
+
+        if (!GetOptI32(j, "device_id", &out->device_id)) return false;
+
+        std::string uri;
+        if (!GetOptString(j, "uri", &uri) || uri.empty()) return false;
+
+        bool realtime = true;
+        bool loop = false;
+        if (!GetOptBool(j, "realtime_playback", &realtime)) return false;
+        if (!GetOptBool(j, "loop_playback", &loop)) return false;
+
+        if (!GetOptDouble(j, "npu_max_fps", &out->npu_max_fps)) return false;
+
+        if (!GetOptU32(j, "log_every_n_frames", &out->log_every_n_frames)) return false;
+
+        if (j.contains("npu")) {
+            const auto& n = j["npu"];
+            if (!n.is_object()) return false;
+            if (!GetOptBool(n, "enable", &out->npu.enable)) return false;
+            if (!GetOptBool(n, "enable_osd", &out->npu.enable_osd)) return false;
+            if (!GetOptBool(n, "enable_tracking", &out->npu.enable_tracking)) return false;
+            if (!GetOptI32(n, "track_buffer", &out->npu.track_buffer)) return false;
+            if (!GetOptBool(n, "kalman_smooth", &out->npu.kalman_smooth)) return false;
+            if (!GetOptString(n, "ax_plugin_path", &out->npu.ax_plugin_path)) return false;
+            if (!GetOptString(n, "ax_plugin_isolation", &out->npu.ax_plugin_isolation)) return false;
+            if (n.contains("ax_plugin_init_info")) {
+                const auto& init = n["ax_plugin_init_info"];
+                if (!init.is_object()) return false;
+                out->npu.ax_plugin_init_json = init.dump();
+            }
+        }
+
+        out->sdk.device_id = out->device_id;
+        out->sdk.input.uri = uri;
+        out->sdk.input.realtime_playback = realtime;
+        out->sdk.input.loop_playback = loop;
+
+        // Default: follow decoded frame (usually NV12) and original resolution.
+        out->sdk.frame_output.output_image = {};
+        out->sdk.frame_output.resize = {};
+
+        if (j.contains("frame_output")) {
+            const auto& fo = j["frame_output"];
+            if (!fo.is_object()) return false;
+            std::string fmt;
+            if (!GetOptString(fo, "format", &fmt)) return false;
+            if (!fmt.empty()) {
+                const auto pf = ParsePixelFormat(fmt);
+                if (pf == axvsdk::common::PixelFormat::kUnknown) return false;
+                out->sdk.frame_output.output_image.format = pf;
+            }
+            std::uint32_t w = out->sdk.frame_output.output_image.width;
+            std::uint32_t h = out->sdk.frame_output.output_image.height;
+            if (!GetOptU32(fo, "width", &w) || !GetOptU32(fo, "height", &h)) return false;
+            out->sdk.frame_output.output_image.width = w;
+            out->sdk.frame_output.output_image.height = h;
+            if (fo.contains("resize")) {
+                if (!ParseResizeOptions(fo["resize"], &out->sdk.frame_output.resize)) return false;
+            }
+        }
+
+        // frame_output is always honored. When NPU input differs from the decoder source space,
+        // ax-pipeline should map detections back to source coordinates before OSD/tracking.
+
+        out->sdk.outputs.clear();
+        if (j.contains("outputs")) {
+            if (!j["outputs"].is_array()) return false;
+            for (const auto& o : j["outputs"]) {
+                axvsdk::pipeline::PipelineOutputConfig oc{};
+                if (!ParseOutput(o, &oc)) return false;
+                out->sdk.outputs.push_back(std::move(oc));
+            }
+        }
+
+        return true;
+    }
+
+    static bool ParseOutput(const json& o, axvsdk::pipeline::PipelineOutputConfig* out) {
+        if (out == nullptr || !o.is_object()) return false;
+
+        axvsdk::pipeline::PipelineOutputConfig oc{};
+
+        std::string codec;
+        if (!GetOptString(o, "codec", &codec)) return false;
+        if (!codec.empty()) {
+            oc.codec = ParseVideoCodec(codec);
+            if (oc.codec == axvsdk::codec::VideoCodecType::kUnknown) return false;
+        }
+
+        if (!GetOptU32(o, "width", &oc.width) ||
+            !GetOptU32(o, "height", &oc.height) ||
+            !GetOptDouble(o, "frame_rate", &oc.frame_rate) ||
+            !GetOptU32(o, "bitrate_kbps", &oc.bitrate_kbps) ||
+            !GetOptU32(o, "gop", &oc.gop) ||
+            !GetOptSizeT(o, "input_queue_depth", &oc.input_queue_depth)) {
+            return false;
+        }
+
+        std::string overflow;
+        if (!GetOptString(o, "overflow_policy", &overflow)) return false;
+        if (!overflow.empty()) oc.overflow_policy = ParseOverflowPolicy(overflow);
+
+        if (o.contains("resize")) {
+            if (!ParseResizeOptions(o["resize"], &oc.resize)) return false;
+        }
+
+        if (o.contains("uris")) {
+            if (!o["uris"].is_array()) return false;
+            for (const auto& u : o["uris"]) {
+                if (!u.is_string()) return false;
+                oc.uris.push_back(u.get<std::string>());
+            }
+        }
+
+        *out = std::move(oc);
+        return true;
+    }
+};
+
+}  // namespace axpipeline

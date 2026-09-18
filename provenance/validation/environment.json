@@ -1,0 +1,7 @@
+{
+  "uname": "Linux dshanpi-a1 6.1.115-vendor-rk35xx #1 SMP Wed Sep  3 06:44:51 EDT 2025 aarch64 aarch64 aarch64 GNU/Linux",
+  "os_release": "PRETTY_NAME=\"Armbian-unofficial 25.11.0-trunk noble\"\nNAME=\"Ubuntu\"\nVERSION_ID=\"24.04\"\nVERSION=\"24.04 LTS (Noble Numbat)\"\nVERSION_CODENAME=noble\nID=ubuntu\nID_LIKE=debian\nHOME_URL=\"https://www.armbian.com\"\nSUPPORT_URL=\"https://forum.armbian.com\"\nBUG_REPORT_URL=\"https://www.armbian.com/bugs\"\nPRIVACY_POLICY_URL=\"https://www.armbian.com\"\nUBUNTU_CODENAME=noble\nLOGO=\"armbian-logo\"\nARMBIAN_PRETTY_NAME=\"Armbian-unofficial 25.11.0-trunk noble\"\n",
+  "cmake": "cmake version 3.28.3",
+  "gcc": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04) 13.3.0",
+  "opencv": "4.6.0"
+}

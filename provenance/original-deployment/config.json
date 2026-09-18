@@ -1,0 +1,108 @@
+{
+  "output_fps": 30,
+  "overview": "rtsp://0.0.0.0:8554/overview",
+  "channels": [
+    {
+      "name": "pcd",
+      "kind": "pcd",
+      "title": "PCD + tracking",
+      "input": "/home/baiwen/ax-pipeline/video/1080p/traffic.mp4",
+      "source_name": "traffic.mp4",
+      "model": "/home/baiwen/ax-pipeline/pcd.axmodel",
+      "output": "rtsp://0.0.0.0:8554/pcd",
+      "plugin": "/home/baiwen/ax-pipeline/six/npu-release/plugins/libax_plugin_pcd.so",
+      "plugin_options": {
+        "model_path": "/home/baiwen/ax-pipeline/pcd.axmodel",
+        "conf_threshold": 0.3,
+        "enable_tracking": false,
+        "max_det": 50,
+        "num_classes": 3,
+        "strides": [
+          16,
+          32
+        ]
+      },
+      "source_fps": 12
+    },
+    {
+      "name": "vehicle",
+      "kind": "vehicle",
+      "title": "YOLOv8s road objects",
+      "input": "/home/baiwen/ax-pipeline/video/1080p/traffic4.mp4",
+      "source_name": "traffic4.mp4",
+      "model": "/home/baiwen/ax-pipeline/six/models/vehicle.axmodel",
+      "output": "rtsp://0.0.0.0:8554/vehicle",
+      "plugin": "/home/baiwen/ax-pipeline/six/npu-release/plugins/libax_plugin_yolov8_split.so",
+      "plugin_options": {
+        "model_path": "/home/baiwen/ax-pipeline/six/models/vehicle.axmodel",
+        "conf_threshold": 0.3,
+        "enable_tracking": false,
+        "max_det": 50
+      },
+      "source_fps": 25
+    },
+    {
+      "name": "seg",
+      "kind": "seg",
+      "title": "YOLO26n instance masks",
+      "input": "/home/baiwen/ax-pipeline/video/1080p/traffic3_slow_0p5x.mp4",
+      "source_name": "traffic3_slow_0p5x.mp4",
+      "model": "/home/baiwen/ax-pipeline/six/models/seg.axmodel",
+      "output": "rtsp://0.0.0.0:8554/seg",
+      "source_fps": 30
+    },
+    {
+      "name": "driving",
+      "kind": "vehicle",
+      "title": "YOLO26n + tracking",
+      "input": "/home/baiwen/ax-pipeline/video/1080p/traffic7_slow_0p5x.mp4",
+      "source_name": "traffic7_slow_0p5x.mp4",
+      "model": "/home/baiwen/ax-pipeline/six/models/yolo26n.axmodel",
+      "output": "rtsp://0.0.0.0:8554/driving",
+      "enable_tracking": true,
+      "show_unconfirmed_detections": true,
+      "plugin": "/home/baiwen/ax-pipeline/six/npu-release/plugins/libax_plugin_yolo26.so",
+      "plugin_options": {
+        "model_path": "/home/baiwen/ax-pipeline/six/models/yolo26n.axmodel",
+        "num_classes": 80,
+        "conf_threshold": 0.3,
+        "nms_threshold": 0.45,
+        "max_det": 50,
+        "enable_tracking": false,
+        "resize_mode": "keep_aspect",
+        "background_color": 0
+      },
+      "source_fps": 29.97002997002997
+    },
+    {
+      "name": "depth",
+      "kind": "depth",
+      "title": "YOLO26n relative depth",
+      "input": "/home/baiwen/ax-pipeline/video/1080p/traffic5.mp4",
+      "source_name": "traffic5.mp4",
+      "model": "/home/baiwen/ax-pipeline/six/models/depth.axmodel",
+      "output": "rtsp://0.0.0.0:8554/depth",
+      "source_fps": 23.976023976023978
+    },
+    {
+      "name": "count",
+      "kind": "count",
+      "title": "Vehicle line counting",
+      "input": "/home/baiwen/ax-pipeline/video/1080p/traffic6.mp4",
+      "source_name": "traffic6.mp4",
+      "model": "/home/baiwen/ax-pipeline/six/models/vehicle.axmodel",
+      "output": "rtsp://0.0.0.0:8554/count",
+      "plugin": "/home/baiwen/ax-pipeline/six/npu-release/plugins/libax_plugin_yolov8_split.so",
+      "plugin_options": {
+        "model_path": "/home/baiwen/ax-pipeline/six/models/vehicle.axmodel",
+        "conf_threshold": 0.3,
+        "enable_tracking": false,
+        "max_det": 50
+      },
+      "line_x": 0.4,
+      "line_deadband": 0.015,
+      "source_loop_us": 12666464,
+      "source_fps": 24
+    }
+  ]
+}

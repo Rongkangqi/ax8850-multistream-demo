@@ -1,0 +1,27 @@
+[
+  {
+    "path": "prebuilt/linux-aarch64/bin/six_app",
+    "bytes": 733352,
+    "sha256": "a8d626d99735659be3854b4ea11dd7cddd0e95e3ce6714999c1229d8ca63403b"
+  },
+  {
+    "path": "prebuilt/linux-aarch64/lib/libax_video_sdk.so",
+    "bytes": 1131952,
+    "sha256": "673a94cefafc96c1ace95d3a6c71ad351e3cfbace1f2d2d314d901a646cabed4"
+  },
+  {
+    "path": "prebuilt/linux-aarch64/lib/plugins/libax_plugin_pcd.so",
+    "bytes": 703512,
+    "sha256": "de6406b228bba5998a5c656d04ecca72487ab223824c0a015e093b077b3be207"
+  },
+  {
+    "path": "prebuilt/linux-aarch64/lib/plugins/libax_plugin_yolo26.so",
+    "bytes": 781320,
+    "sha256": "ce9a5dca5fce4c7a59cbbdc33703c594e0d9cca74889bdde630964e40ff879d6"
+  },
+  {
+    "path": "prebuilt/linux-aarch64/lib/plugins/libax_plugin_yolov8_split.so",
+    "bytes": 781480,
+    "sha256": "cd464e1e44e135a232aa6b972143d636597e12fd843f46bf5ddacf50163bdc6f"
+  }
+]

@@ -1,0 +1,392 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+      - 'fix/**'
+      - 'feat/**'
+  pull_request:
+
+# 工业落地质量栅栏：
+#   1. Release 基础构建 & 测试（Linux + Windows）
+#   2. ThreadSanitizer（锁序、paths_ 竞争、config 竞争、SSRC 一致性 —— C1/C3/C4/C5）
+#   3. AddressSanitizer + UndefinedBehaviorSanitizer（内存安全与未定义行为）
+#   4. 高并发压测（test_concurrent_setup 多次触发，观察偶发）
+#   5. 兼容性冒烟：用 ffmpeg 验证 DESCRIBE/SETUP/PLAY/RTCP SSRC 一致性
+jobs:
+  build-and-test:
+    name: Release build & test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test (Linux)
+        if: runner.os != 'Windows'
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  thread-sanitizer:
+    name: ThreadSanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (TSan)
+        run: |
+          cmake -S . -B build-tsan \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g -O1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread" \
+            -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF
+
+      - name: Build (TSan)
+        run: cmake --build build-tsan --parallel
+
+      - name: Run tests (TSan)
+        env:
+          # halt_on_error=1 让 TSan 在首个竞争处返回非零
+          # second_deadlock_stack=1 输出两端持锁栈，便于定位
+          TSAN_OPTIONS: "halt_on_error=1 abort_on_error=0 second_deadlock_stack=1 suppressions=${{ github.workspace }}/ci/tsan.supp"
+        run: ctest --test-dir build-tsan --output-on-failure
+
+  address-sanitizer:
+    name: AddressSanitizer + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (ASan/UBSan)
+        run: |
+          cmake -S . -B build-asan \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=address,undefined" \
+            -DBUILD_TESTS=ON -DBUILD_EXAMPLES=OFF
+
+      - name: Build (ASan)
+        run: cmake --build build-asan --parallel
+
+      - name: Run tests (ASan + UBSan)
+        env:
+          ASAN_OPTIONS: "abort_on_error=0 halt_on_error=1 detect_leaks=1 check_initialization_order=1"
+          UBSAN_OPTIONS: "print_stacktrace=1 halt_on_error=1"
+        run: ctest --test-dir build-asan --output-on-failure
+
+  rtmp-smoke:
+    name: RTMP smoke (publish to mediamtx)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+          cmake --build build --parallel
+      - name: Install ffprobe
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      # 用真实 mediamtx 收我们 publisher 推的流，再用 ffprobe 验证读出 H264。
+      #
+      # 整段 publish→probe 包进 3 次重试：GitHub Actions runner 的 docker 网络偶发
+      # 把 TCP 字节吞掉（publisher 自称 send 成功、mediamtx 报 i/o timeout 收不到，
+      # = docker-proxy buffer 问题；本地 100% 可复现通过）。--network host 已大幅缓解
+      # 但未根治，故任一次尝试成功即通过、3 次全失败才判红。版本 pin 到具体 tag。
+      - name: Publish to mediamtx + probe (retry flaky runner networking)
+        run: |
+          set +e
+          attempt() {
+            docker rm -f mtx >/dev/null 2>&1
+            docker run -d --name mtx --network host bluenviron/mediamtx:1.18.0 >/dev/null
+            # 等 RTMP 端口真的 listen
+            for i in $(seq 1 30); do
+              ss -lnt 2>/dev/null | grep -q ':1935 ' && break
+              sleep 1
+            done
+            # 后台推 15 秒，比 ffprobe 的读取窗口长，保证帧流持续
+            timeout 15 ./build/examples/example_rtmp_publisher \
+              rtmp://127.0.0.1:1935/live/ci-test > /tmp/pub.log 2>&1 &
+            # 等推流者确实连上（mediamtx 日志里有 "is publishing to path"）
+            local online=0
+            for i in $(seq 1 20); do
+              if docker logs mtx 2>&1 | grep -q "is publishing to path 'live/ci-test'"; then
+                online=1; break
+              fi
+              sleep 1
+            done
+            [ "$online" = 1 ] || return 1
+            ffprobe -v error -print_format json -show_streams -rw_timeout 5000000 \
+              rtmp://127.0.0.1:1935/live/ci-test > /tmp/probe.json 2> /tmp/probe.err
+            # 宽松匹配：接受 "codec_name": "h264" 或 "codec_name":"h264"（空格可选）
+            grep -qE '"codec_name"[[:space:]]*:[[:space:]]*"h264"' /tmp/probe.json
+          }
+          for try in 1 2 3; do
+            echo "=== RTMP smoke attempt ${try}/3 ==="
+            if attempt; then
+              echo "RTMP smoke passed on attempt ${try}"
+              grep -i codec_name /tmp/probe.json || true
+              exit 0
+            fi
+            echo "--- attempt ${try} failed; diagnostics ---"
+            echo "ffprobe stderr:"; cat /tmp/probe.err 2>/dev/null
+            echo "publisher log:"; cat /tmp/pub.log 2>/dev/null
+            echo "mediamtx log tail:"; docker logs mtx 2>&1 | tail -20
+            # 杀掉本次后台 publisher，避免与下次尝试串台
+            pkill -f example_rtmp_publisher 2>/dev/null
+            sleep 2
+          done
+          echo "RTMP smoke failed after 3 attempts"
+          exit 1
+      - name: Cleanup
+        if: always()
+        run: |
+          pkill -f example_rtmp_publisher 2>/dev/null || true
+          docker rm -f mtx 2>/dev/null || true
+
+  stress:
+    name: Stress (concurrent setup loop)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # 跑 20 轮并发 SETUP/推帧：偶发的锁序/端口并发问题容易在重复中暴露
+      - name: Stress loop
+        run: |
+          set -e
+          for i in $(seq 1 20); do
+            echo "== iteration $i =="
+            ./build/tests/rtsp_test_concurrent_setup
+          done
+
+  onvif-smoke:
+    name: ONVIF smoke (loopback discovery + SOAP)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+          cmake --build build --parallel
+      # 1) example_onvif_server 启动 → curl 打 device_service 得到 200
+      # 2) 再跑 ctest 里的 onvif_discovery / onvif_soap 作为双保险
+      - name: Smoke — example_onvif_server + curl
+        run: |
+          set -e
+          ./build/examples/example_onvif_server --port 9554 --http 9580 --path /live/stream > /tmp/onvif_srv.log 2>&1 &
+          SRV=$!
+          sleep 2
+          # 打一个 GetCapabilities（匿名允许）
+          cat > /tmp/req.xml <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+                         xmlns:tds="http://www.onvif.org/ver10/device/wsdl">
+            <soap:Body><tds:GetCapabilities><tds:Category>All</tds:Category></tds:GetCapabilities></soap:Body>
+          </soap:Envelope>
+          EOF
+          RESP=$(curl -sS -X POST \
+            -H 'Content-Type: application/soap+xml; charset=utf-8' \
+            -H 'SOAPAction: "http://www.onvif.org/ver10/device/wsdl/GetCapabilities"' \
+            --data-binary @/tmp/req.xml \
+            http://127.0.0.1:9580/onvif/device_service)
+          echo "$RESP" | head -5
+          echo "$RESP" | grep -q "GetCapabilitiesResponse"
+          echo "$RESP" | grep -q ":9580/onvif/media_service"
+          kill $SRV 2>/dev/null || true
+          wait $SRV 2>/dev/null || true
+      - name: ctest onvif_* only
+        run: ctest --test-dir build --output-on-failure -R "onvif"
+
+  compat-smoke:
+    name: Compatibility smoke (ffmpeg)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON -DBUILD_EXAMPLES=ON
+          cmake --build build --parallel
+
+      # 启动 example_server，用 ffmpeg 模拟真实客户端过一轮 DESCRIBE/SETUP/PLAY/RTCP。
+      # 目的：回归 C4 (RTCP SSRC) 与 M6 (Content-Base) 对严格客户端的兼容性。
+      # ffmpeg -t 5 录 5 秒，能正常拿到帧即 OK。
+      - name: Smoke with ffmpeg (UDP + TCP)
+        run: |
+          set -e
+          ./build/examples/example_server 8554 /live/stream > /tmp/srv.log 2>&1 &
+          SERVER_PID=$!
+          sleep 2
+
+          # UDP：应能收到帧
+          timeout 10 ffmpeg -rtsp_transport udp -i rtsp://127.0.0.1:8554/live/stream \
+            -t 5 -c copy -f null - -hide_banner -loglevel warning 2>&1 | tee /tmp/udp.log
+          # TCP interleaved：应能收到帧
+          timeout 10 ffmpeg -rtsp_transport tcp -i rtsp://127.0.0.1:8554/live/stream \
+            -t 5 -c copy -f null - -hide_banner -loglevel warning 2>&1 | tee /tmp/tcp.log
+
+          kill $SERVER_PID 2>/dev/null || true
+          wait $SERVER_PID 2>/dev/null || true
+
+          echo "--- server log tail ---"
+          tail -30 /tmp/srv.log
+          # 要求 UDP/TCP 至少有一帧通过；出现 'Invalid data' / 'No such file' 视为失败
+          grep -q "Invalid data found when processing input" /tmp/udp.log && exit 1 || true
+          grep -q "Invalid data found when processing input" /tmp/tcp.log && exit 1 || true
+
+  rtsp-cli-smoke:
+    name: rtsp-cli loopback (push self-host -> pull -> ffprobe)
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure & build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_APPS=ON -DBUILD_TESTS=OFF -DBUILD_EXAMPLES=OFF
+          cmake --build build --target rtsp-cli --parallel
+      - name: Install ffprobe
+        run: sudo apt-get update -y && sudo apt-get install -y ffmpeg
+      # push 用提交进仓库的小 .h264 自起 server 无限循环；pull 拉 3s 存 mp4；
+      # ffprobe 验证存出的 mp4 是有效 h264。无需编码器，零外部依赖。
+      - name: Loopback push + pull
+        run: |
+          set +e
+          BIN=build/apps/rtsp-cli/rtsp-cli
+          FIX=apps/rtsp-cli/testdata/sample.h264
+          "$BIN" push -i "$FIX" -o rtsp://127.0.0.1:8554/live -r -1 > /tmp/push.log 2>&1 &
+          PUSH=$!
+          for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ':8554 ' && break; sleep 0.25; done
+          "$BIN" pull -i rtsp://127.0.0.1:8554/live -o /tmp/out.mp4 -t 3 --quiet > /tmp/pull.log 2>&1
+          PULL_EC=$?
+          kill "$PUSH" 2>/dev/null
+          echo "=== push log ==="; cat /tmp/push.log
+          echo "=== pull log ==="; cat /tmp/pull.log
+          echo "=== ffprobe out.mp4 ==="
+          ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,width,height,nb_frames \
+            -of default=noprint_wrappers=1 /tmp/out.mp4
+          echo "pull exit=$PULL_EC"
+          test "$PULL_EC" = 0 || exit 1
+          ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 /tmp/out.mp4 | grep -q h264
+      # 多消费者回归：一个 self-host server + N 个并发 rtsp-cli 拉流，每个都必须收到帧。
+      # 专门守护"并发客户端 RTP 端口撞车"回归——修复前同机多个客户端都绑 20000，
+      # SO_REUSEADDR 让服务端把流全发到一个口，只有一个客户端能收到帧（1/N）。
+      # 另起一个 ffmpeg 消费者做独立交叉验证（隔离 server-vs-client 问题）。
+      # 稳定要点：动态空闲端口（不硬编码）、就绪轮询 + 显式 listen 断言、按 PID 数组
+      # 精确 kill、只 wait 有界的消费者（不 wait 无限 push）、逐个消费者断言帧数正确。
+      - name: Multi-consumer (concurrent pulls must each receive frames)
+        run: |
+          set +e
+          BIN=build/apps/rtsp-cli/rtsp-cli
+          FIX=apps/rtsp-cli/testdata/sample.h264
+          N=3
+          # 动态拿一个空闲端口，避免硬编码撞车
+          PORT=$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')
+          echo "server port=$PORT, consumers=$N"
+          "$BIN" push -i "$FIX" -o rtsp://127.0.0.1:$PORT/live -r -1 > /tmp/mcpush.log 2>&1 &
+          PUSH=$!
+          trap 'kill $PUSH 2>/dev/null; pkill -x rtsp-cli 2>/dev/null' EXIT
+          # 就绪轮询 + 显式断言 server 真的起来了
+          for i in $(seq 1 40); do ss -ltn 2>/dev/null | grep -q ":$PORT " && break; sleep 0.25; done
+          ss -ltn 2>/dev/null | grep -q ":$PORT " || { echo "server failed to bind $PORT"; cat /tmp/mcpush.log; exit 1; }
+          # N 个并发 rtsp-cli 消费者，各存各的 mp4，记录 PID
+          PIDS=()
+          for i in $(seq 1 $N); do
+            "$BIN" pull -i rtsp://127.0.0.1:$PORT/live -o /tmp/mc$i.mp4 -t 4 --quiet > /tmp/mc$i.log 2>&1 &
+            PIDS+=($!)
+          done
+          # 独立交叉验证：一个 ffmpeg 消费者（UDP）
+          timeout 12 ffmpeg -rtsp_transport udp -i rtsp://127.0.0.1:$PORT/live \
+            -t 4 -c copy -f null - -hide_banner -loglevel warning > /tmp/mcff.log 2>&1 &
+          FF=$!
+          wait "${PIDS[@]}"        # 只等有界的消费者，不等无限 push
+          wait $FF 2>/dev/null
+          kill $PUSH 2>/dev/null; pkill -x rtsp-cli 2>/dev/null
+          # 逐个消费者断言：mp4 是 h264 且拿到足够帧数（并发全部成功 = N/N）
+          frames_in_mp4() {
+            ffprobe -v error -select_streams v:0 -count_packets \
+              -show_entries stream=nb_read_packets -of csv=p=0 "$1" 2>/dev/null
+          }
+          fail=0
+          for i in $(seq 1 $N); do
+            cn=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of csv=p=0 /tmp/mc$i.mp4 2>/dev/null)
+            fr=$(frames_in_mp4 /tmp/mc$i.mp4); fr=${fr:-0}
+            echo "consumer $i: codec=$cn frames=$fr"
+            [ "$cn" = h264 ] || { echo "  !! consumer $i: wrong/no codec"; fail=1; }
+            [ "$fr" -ge 10 ] 2>/dev/null || { echo "  !! consumer $i: too few frames ($fr) — port-collision regression?"; fail=1; }
+          done
+          echo "=== ffmpeg cross-check consumer ==="; cat /tmp/mcff.log
+          grep -q "Invalid data found when processing input" /tmp/mcff.log && { echo "  !! ffmpeg consumer saw invalid data"; fail=1; }
+          if [ "$fail" != 0 ]; then
+            echo "--- push log ---"; cat /tmp/mcpush.log
+            for i in $(seq 1 $N); do echo "--- consumer $i log ---"; cat /tmp/mc$i.log; done
+            exit 1
+          fi
+          echo "all $N concurrent consumers received frames"
+
+      # RTMP leg：push -r -1 推到真实 mediamtx，必须出现 "is publishing" 且 ffprobe 读出 h264。
+      # -r -1 跨循环边界，专门回归"循环时间戳必须单调"——倒退会让 RTMP 服务器拒绝建流。
+      # docker 网络偶发吞包，整段 3 次重试。
+      - name: RTMP push to mediamtx (loop-timestamp regression)
+        run: |
+          set +e
+          BIN=build/apps/rtsp-cli/rtsp-cli
+          FIX=apps/rtsp-cli/testdata/sample.h264
+          attempt() {
+            docker rm -f mtx >/dev/null 2>&1
+            docker run -d --name mtx --network host bluenviron/mediamtx:1.18.0 >/dev/null
+            for i in $(seq 1 30); do ss -lnt 2>/dev/null | grep -q ':1935 ' && break; sleep 1; done
+            "$BIN" push -i "$FIX" -o rtmp://127.0.0.1:1935/live/clicheck -r -1 > /tmp/rpush.log 2>&1 &
+            local pid=$!
+            local pub=0
+            for i in $(seq 1 30); do
+              docker logs mtx 2>&1 | grep -q "is publishing to path 'live/clicheck'" && { pub=1; break; }
+              sleep 0.5
+            done
+            local rc=1
+            if [ "$pub" = 1 ]; then
+              ffprobe -v error -rw_timeout 8000000 -select_streams v:0 -show_entries stream=codec_name \
+                -of csv=p=0 rtmp://127.0.0.1:1935/live/clicheck 2>/dev/null | grep -q h264 && rc=0
+            fi
+            kill "$pid" 2>/dev/null; pkill -x rtsp-cli 2>/dev/null
+            return $rc
+          }
+          for try in 1 2 3; do
+            echo "=== rtmp attempt ${try}/3 ==="
+            if attempt; then echo "rtsp-cli rtmp push OK on attempt ${try}"; exit 0; fi
+            echo "--- attempt ${try} failed; diagnostics ---"
+            cat /tmp/rpush.log 2>/dev/null; docker logs mtx 2>&1 | tail -15
+            sleep 2
+          done
+          echo "rtsp-cli rtmp push failed after 3 attempts"
+          exit 1

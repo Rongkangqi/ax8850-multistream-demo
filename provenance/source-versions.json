@@ -1,0 +1,24 @@
+{
+  "collected_on": "2026-09-18",
+  "sources": [
+    {
+      "directory": "vendor/ax-pipeline",
+      "remote": "https://github.com/AXERA-TECH/ax-pipeline.git",
+      "commit": "ab4c3855c4ce694438c9752c3f56a52061952fef",
+      "tracked_changes": ""
+    },
+    {
+      "directory": "vendor/ax-pipeline/deps/ax-video-sdk",
+      "remote": "https://github.com/AXERA-TECH/ax-video-sdk.git",
+      "commit": "172f343a144464bc1ed436259b4b76c882cd5b2e",
+      "tracked_changes": ""
+    },
+    {
+      "directory": "vendor/ax-pipeline/deps/ax-video-sdk/third-party/rtsp-sdk",
+      "remote": "https://github.com/ZHEQIUSHUI/rtsp-sdk.git",
+      "commit": "346799d77bb368e136c8fd9a98227923679d29bb",
+      "tracked_changes": ""
+    }
+  ],
+  "custom_source": "src/six_app.cpp and patches/npu are the currently deployed custom implementation; root build and launch scripts are portable packaging additions."
+}

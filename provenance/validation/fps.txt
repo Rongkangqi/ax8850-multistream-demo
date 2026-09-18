@@ -1,0 +1,10 @@
+Measured window: 60.1 seconds (video FPS and AI FPS are different)
+Stream       Decode  New video       AI   Encode   Drops*   Errors
+pcd           12.01      11.99    11.99    12.01        0        0
+vehicle       25.08      25.08     9.98    25.04        0        0
+seg           30.00      30.00     6.30    30.02        0        0
+driving       30.00      29.98    10.21    29.98        0        0
+depth         24.01      24.01    10.71    24.01        0        0
+count         24.08      24.08     9.88    24.10        0        0
+Overview encoder: 30.02 FPS
+*Drops: render queue replacement + encoder queue drops, within this window.

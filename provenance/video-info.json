@@ -1,0 +1,98 @@
+[
+  {
+    "file": "traffic.mp4",
+    "programs": [],
+    "streams": [
+      {
+        "codec_name": "h264",
+        "width": 1920,
+        "height": 1080,
+        "avg_frame_rate": "12/1",
+        "nb_frames": "10813"
+      }
+    ],
+    "format": {
+      "duration": "901.083333"
+    }
+  },
+  {
+    "file": "traffic3_slow_0p5x.mp4",
+    "programs": [],
+    "streams": [
+      {
+        "codec_name": "h264",
+        "width": 1920,
+        "height": 1080,
+        "avg_frame_rate": "30/1",
+        "nb_frames": "2404"
+      }
+    ],
+    "format": {
+      "duration": "80.133333"
+    }
+  },
+  {
+    "file": "traffic4.mp4",
+    "programs": [],
+    "streams": [
+      {
+        "codec_name": "h264",
+        "width": 1920,
+        "height": 1080,
+        "avg_frame_rate": "25/1",
+        "nb_frames": "750"
+      }
+    ],
+    "format": {
+      "duration": "30.000000"
+    }
+  },
+  {
+    "file": "traffic5.mp4",
+    "programs": [],
+    "streams": [
+      {
+        "codec_name": "h264",
+        "width": 1920,
+        "height": 1080,
+        "avg_frame_rate": "24000/1001",
+        "nb_frames": "948"
+      }
+    ],
+    "format": {
+      "duration": "39.539500"
+    }
+  },
+  {
+    "file": "traffic6.mp4",
+    "programs": [],
+    "streams": [
+      {
+        "codec_name": "h264",
+        "width": 1920,
+        "height": 1080,
+        "avg_frame_rate": "24/1",
+        "nb_frames": "304"
+      }
+    ],
+    "format": {
+      "duration": "12.666667"
+    }
+  },
+  {
+    "file": "traffic7_slow_0p5x.mp4",
+    "programs": [],
+    "streams": [
+      {
+        "codec_name": "h264",
+        "width": 1920,
+        "height": 1080,
+        "avg_frame_rate": "30000/1001",
+        "nb_frames": "2760"
+      }
+    ],
+    "format": {
+      "duration": "92.092000"
+    }
+  }
+]

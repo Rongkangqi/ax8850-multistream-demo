@@ -1,0 +1,25 @@
+Input #0, rtsp, from 'rtsp://127.0.0.1:8554/overview':
+  Metadata:
+    title           : RTSP Stream
+  Duration: N/A, start: 0.033000, bitrate: N/A
+  Stream #0:0: Video: h264 (Main), yuv420p(tv, bt470bg/bt470bg/bt709, progressive), 1920x1080, 30 fps, 29.97 tbr, 90k tbn
+Output #0, mp4, to 'recordings/overview-20260918-154724.mp4':
+  Metadata:
+    title           : RTSP Stream
+    encoder         : Lavf60.16.100
+  Stream #0:0: Video: h264 (Main) (avc1 / 0x31637661), yuv420p(tv, bt470bg/bt470bg/bt709, progressive), 1920x1080, q=2-31, 30 fps, 29.97 tbr, 90k tbn
+Stream mapping:
+  Stream #0:0 -> #0:0 (copy)
+size=       0kB time=N/A bitrate=N/A speed=N/A    
+size=    1024kB time=00:00:01.33 bitrate=6288.6kbits/s speed= 2.6x    
+size=    1280kB time=00:00:01.83 bitrate=5717.6kbits/s speed=1.79x    
+size=    2048kB time=00:00:02.36 bitrate=7088.1kbits/s speed=1.53x    
+size=    2560kB time=00:00:02.86 bitrate=7314.9kbits/s speed= 1.4x    
+size=    3072kB time=00:00:03.40 bitrate=7401.8kbits/s speed=1.31x    
+size=    3328kB time=00:00:03.90 bitrate=6990.6kbits/s speed=1.26x    
+size=    4096kB time=00:00:04.43 bitrate=7567.6kbits/s speed=1.22x    
+size=    4608kB time=00:00:04.93 bitrate=7650.8kbits/s speed=1.19x    
+[mp4 @ 0xaaaad0bc4df0] Starting second pass: moving the moov atom to the beginning of the file
+[out#0/mp4 @ 0xaaaad0b46ec0] video:4719kB audio:0kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: 0.047494%
+size=    4721kB time=00:00:04.96 bitrate=7786.5kbits/s speed=1.17x    
+Saved: /home/baiwen/ax8850-multistream-demo-check-20260918/recordings/overview-20260918-154724.mp4

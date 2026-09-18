@@ -1,0 +1,341 @@
+cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
+
+project(ax_pipeline LANGUAGES C CXX)
+
+if(" ${CMAKE_SOURCE_DIR}" STREQUAL " ${CMAKE_BINARY_DIR}")
+    message(FATAL_ERROR "In-place builds are not allowed. Use a separate build directory.")
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+option(AXP_BUILD_NPU_SMOKE_TESTS "Build NPU smoke tests (requires HW at runtime)" OFF)
+
+# ---- std::filesystem (toolchain compatibility) ----
+# Some older GCC/libstdc++ toolchains (notably arm/uclibc) still require linking
+# against libstdc++fs for std::filesystem symbols.
+include(CheckCXXSourceCompiles)
+set(_AXP_FILESYSTEM_TEST_SRC "
+  #include <filesystem>
+  int main() {
+    std::filesystem::path p{\".\"};
+    (void)p.is_absolute();
+    return 0;
+  }")
+set(_AXP_NEED_STDCXXFS OFF)
+
+# GCC < 9 typically needs libstdc++fs. Make this the baseline, and then optionally
+# confirm via a compile+link probe (works for cross builds too).
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+    set(_AXP_NEED_STDCXXFS ON)
+endif()
+
+set(CMAKE_REQUIRED_LIBRARIES "")
+check_cxx_source_compiles("${_AXP_FILESYSTEM_TEST_SRC}" _AXP_FILESYSTEM_LINKS)
+if(NOT _AXP_FILESYSTEM_LINKS)
+    set(CMAKE_REQUIRED_LIBRARIES stdc++fs)
+    check_cxx_source_compiles("${_AXP_FILESYSTEM_TEST_SRC}" _AXP_FILESYSTEM_LINKS_WITH_STDCXXFS)
+    if(_AXP_FILESYSTEM_LINKS_WITH_STDCXXFS)
+        set(_AXP_NEED_STDCXXFS ON)
+    endif()
+endif()
+set(CMAKE_REQUIRED_LIBRARIES "")
+
+# ---- ax-video-sdk (submodule) ----
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/deps/ax-video-sdk/CMakeLists.txt")
+    message(FATAL_ERROR "Missing submodule deps/ax-video-sdk. Run: git submodule update --init --recursive")
+endif()
+
+# Force shared build so consumers (this app) don't need to link MSP libs explicitly.
+set(AXSDK_BUILD_SHARED ON CACHE BOOL "" FORCE)
+set(AXSDK_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(AXSDK_BUILD_SMOKE_TESTS OFF CACHE BOOL "" FORCE)
+
+# ax-video-sdk expects these cache variables:
+# - AXSDK_CHIP_TYPE
+# - AXSDK_MSP_DIR (non-AXCL) OR AXSDK_AXCL_DIR (AXCL)
+add_subdirectory(deps/ax-video-sdk deps/ax-video-sdk-build)
+
+# ---- third-party (ByteTrack) ----
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third-party/ByteTrack/CMakeLists.txt")
+    add_subdirectory(third-party/ByteTrack)
+else()
+    message(FATAL_ERROR "Missing third-party/ByteTrack")
+endif()
+
+# ---- tracking (shared wrapper) ----
+add_library(ax_pipeline_tracking STATIC
+    src/tracking/ax_bytetrack.cpp
+)
+
+target_include_directories(ax_pipeline_tracking
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/third-party/ByteTrack/include
+)
+
+target_compile_options(ax_pipeline_tracking PRIVATE
+    -Wall -Wextra -Wno-unused-parameter
+)
+
+target_link_libraries(ax_pipeline_tracking PUBLIC ByteTrack)
+
+# ---- plugins ----
+add_subdirectory(plugins)
+
+# ---- app ----
+option(AXP_ENABLE_WEBUI "Embed the web console page into ax_pipeline_app (GET /)" ON)
+option(AXP_ENABLE_PREVIEW "Enable snapshot/MJPEG preview endpoints (preview.jpg, stream.mjpeg)" ON)
+
+# Embed the web console into the app binary.
+set(AXP_WEBUI_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/app/webui/index.html)
+set(AXP_WEBUI_GEN ${CMAKE_CURRENT_BINARY_DIR}/generated/webui_html.cpp)
+add_custom_command(OUTPUT ${AXP_WEBUI_GEN}
+    COMMAND ${CMAKE_COMMAND} -DIN=${AXP_WEBUI_SRC} -DOUT=${AXP_WEBUI_GEN}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_webui.cmake
+    DEPENDS ${AXP_WEBUI_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_webui.cmake
+    COMMENT "Embedding web console")
+
+add_executable(ax_pipeline_app
+    src/main.cpp
+    $<$<BOOL:${AXP_ENABLE_WEBUI}>:${AXP_WEBUI_GEN}>
+    src/ai/async_infer.cpp
+    src/app/pipeline_instance.cpp
+    src/app/pipeline_service.cpp
+    src/app/http_api_server.cpp
+    src/ax_plugin/ax_plugin_client.cpp
+    src/ax_plugin/ax_plugin_loader.cpp
+    src/ax_plugin/ax_plugin_process.cpp
+)
+
+target_include_directories(ax_pipeline_app
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/ax-video-sdk/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/ax-video-sdk/third-party/rtsp-sdk/third_party
+        ${CMAKE_CURRENT_SOURCE_DIR}/third-party/ByteTrack/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third-party/cmdline
+        ${CMAKE_CURRENT_SOURCE_DIR}/third-party/json
+)
+
+target_compile_options(ax_pipeline_app PRIVATE
+    -Wall -Wextra -Wno-unused-parameter
+)
+if(AXP_ENABLE_WEBUI)
+    target_compile_definitions(ax_pipeline_app PRIVATE AXP_ENABLE_WEBUI=1)
+endif()
+if(AXP_ENABLE_PREVIEW)
+    target_compile_definitions(ax_pipeline_app PRIVATE AXP_ENABLE_PREVIEW=1)
+endif()
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(ax_pipeline_app PRIVATE dl)
+endif()
+
+target_link_libraries(ax_pipeline_app PRIVATE ax_video_sdk ax_video_sdk::ax_msp ax_pipeline_tracking)
+
+if(DEFINED AXSDK_CHIP_TYPE)
+    string(TOLOWER "${AXSDK_CHIP_TYPE}" AXP_CHIP_APP_PLATFORM)
+    if(AXP_CHIP_APP_PLATFORM STREQUAL "axcl")
+        target_compile_definitions(ax_pipeline_app PRIVATE AXPIPELINE_APP_PLATFORM_AXCL=1)
+        # AXCL: allow incomplete vendor .so dependencies (e.g. fmt/spdlog) at link time in CI/cross builds.
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_link_options(ax_pipeline_app PRIVATE -Wl,--allow-shlib-undefined)
+        endif()
+        # Needed by subprocess isolation path to copy AXCL device frames to host.
+        # Also link common AXCL module libs so ax-video-sdk's AXCL backend resolves at runtime.
+        target_link_libraries(ax_pipeline_app PRIVATE
+            axcl_rt
+            axcl_sys
+            axcl_ivps
+            axcl_vdec
+            axcl_venc
+            axcl_npu
+        )
+    else()
+        # When cross-building, allow unresolved MSP symbols inside dependent shared objects.
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_link_options(ax_pipeline_app PRIVATE -Wl,--allow-shlib-undefined)
+        endif()
+    endif()
+endif()
+
+if(_AXP_NEED_STDCXXFS)
+    target_link_libraries(ax_pipeline_app PRIVATE stdc++fs)
+endif()
+
+install(TARGETS ax_pipeline_app RUNTIME DESTINATION bin)
+
+# ---- plugin host (subprocess isolation) ----
+add_executable(ax_plugin_host
+    src/ax_plugin/ax_plugin_host.cpp
+)
+
+target_include_directories(ax_plugin_host
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/ax-video-sdk/include
+)
+
+target_compile_options(ax_plugin_host PRIVATE
+    -Wall -Wextra -Wno-unused-parameter
+)
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(ax_plugin_host PRIVATE dl)
+endif()
+
+target_link_libraries(ax_plugin_host PRIVATE ax_video_sdk)
+
+if(DEFINED AXSDK_CHIP_TYPE)
+    string(TOLOWER "${AXSDK_CHIP_TYPE}" AXP_CHIP_PLUGIN_HOST_PLATFORM)
+    if(AXP_CHIP_PLUGIN_HOST_PLATFORM STREQUAL "axcl")
+        # AXCL: allow incomplete vendor .so dependencies (e.g. fmt/spdlog) at link time in CI/cross builds.
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_link_options(ax_plugin_host PRIVATE -Wl,--allow-shlib-undefined)
+        endif()
+    else()
+        # MSP cross builds: ax-video-sdk is a shared library and depends on vendor MSP .so's.
+        # The linker may treat those transitive dependencies as unresolved unless we allow it here,
+        # similar to ax_pipeline_app.
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_link_options(ax_plugin_host PRIVATE -Wl,--allow-shlib-undefined)
+        endif()
+    endif()
+endif()
+
+if(_AXP_NEED_STDCXXFS)
+    target_link_libraries(ax_plugin_host PRIVATE stdc++fs)
+endif()
+
+install(TARGETS ax_plugin_host RUNTIME DESTINATION bin)
+install(DIRECTORY configs DESTINATION .)
+
+# ---- model runtime test (requires HW at runtime) ----
+add_executable(ax_pipeline_model_test
+    src/tests/test_model_det_images.cpp
+)
+target_include_directories(ax_pipeline_model_test
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/ax-video-sdk/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/third-party/cmdline
+)
+target_compile_options(ax_pipeline_model_test PRIVATE
+    -Wall -Wextra -Wno-unused-parameter
+)
+target_link_libraries(ax_pipeline_model_test PRIVATE ax_plugin_npu_common)
+
+# ---- debug tool: dump MP4 video samples to AnnexB elementary stream ----
+# Used to validate demux output against board samples (e.g. /opt/bin/sample_vdec).
+add_executable(ax_mp4_dump_annexb
+    src/mp4_dump_annexb.cpp
+)
+
+target_include_directories(ax_mp4_dump_annexb
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/ax-video-sdk/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/ax-video-sdk/src/codec
+        ${CMAKE_CURRENT_SOURCE_DIR}/third-party/cmdline
+)
+
+target_compile_options(ax_mp4_dump_annexb PRIVATE
+    -Wall -Wextra -Wno-unused-parameter
+)
+
+target_link_libraries(ax_mp4_dump_annexb PRIVATE ax_video_sdk)
+
+if(DEFINED AXSDK_CHIP_TYPE)
+    string(TOLOWER "${AXSDK_CHIP_TYPE}" AXP_CHIP_NORMALIZED_TOOL)
+    if(AXP_CHIP_NORMALIZED_TOOL STREQUAL "axcl")
+        # Cross-linkers often do not follow DT_NEEDED dependencies when resolving symbols
+        # (no-copy-dt-needed-entries). libax_video_sdk.so is linked against AXCL libs,
+        # but the final executable still needs them on the link line to avoid undefined refs.
+        target_link_libraries(ax_mp4_dump_annexb PRIVATE ax_video_sdk::ax_msp axcl_rt axcl_sys axcl_vdec axcl_venc axcl_ivps)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_link_options(ax_mp4_dump_annexb PRIVATE -Wl,--allow-shlib-undefined)
+        endif()
+    else()
+        target_link_libraries(ax_mp4_dump_annexb PRIVATE ax_video_sdk::ax_msp)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            target_link_options(ax_mp4_dump_annexb PRIVATE -Wl,--allow-shlib-undefined)
+        endif()
+    endif()
+endif()
+
+install(TARGETS ax_mp4_dump_annexb RUNTIME DESTINATION bin)
+
+# ---- unit tests (host-only) ----
+enable_testing()
+
+add_executable(ax_plugin_client_test
+    src/tests/test_plugin_client.cpp
+    src/ax_plugin/ax_plugin_client.cpp
+    src/ax_plugin/ax_plugin_loader.cpp
+    src/ax_plugin/ax_plugin_process.cpp
+)
+
+target_include_directories(ax_plugin_client_test
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/deps/ax-video-sdk/include
+)
+
+target_compile_options(ax_plugin_client_test PRIVATE
+    -Wall -Wextra -Wno-unused-parameter
+)
+
+if(UNIX AND NOT APPLE)
+    target_link_libraries(ax_plugin_client_test PRIVATE dl)
+endif()
+
+target_link_libraries(ax_plugin_client_test PRIVATE ax_video_sdk ax_video_sdk::ax_msp)
+
+# AXCL: test binary links axcl_rt for device->host copy helper when built for AXCL.
+if(DEFINED AXSDK_CHIP_TYPE)
+    string(TOLOWER "${AXSDK_CHIP_TYPE}" AXP_CHIP_TEST_PLATFORM)
+    if(AXP_CHIP_TEST_PLATFORM STREQUAL "axcl")
+        target_link_libraries(ax_plugin_client_test PRIVATE axcl_rt)
+    endif()
+endif()
+
+# In-proc plugin smoke: should work everywhere.
+add_test(NAME plugin_blank_inproc
+    COMMAND ax_plugin_client_test
+        --mode=inproc
+        --so=$<TARGET_FILE:ax_plugin_blank>
+)
+
+add_test(NAME plugin_blank_inproc_reopen
+    COMMAND ax_plugin_client_test
+        --mode=inproc
+        --iters=10
+        --so=$<TARGET_FILE:ax_plugin_blank>
+)
+
+# Subprocess plugin smoke (unix only).
+if(UNIX AND NOT APPLE)
+    add_test(NAME plugin_blank_process
+        COMMAND ax_plugin_client_test
+            --mode=process
+            --so=$<TARGET_FILE:ax_plugin_blank>
+    )
+
+    add_test(NAME plugin_blank_process_reopen
+        COMMAND ax_plugin_client_test
+            --mode=process
+            --iters=5
+            --so=$<TARGET_FILE:ax_plugin_blank>
+    )
+
+    # Crash isolation: blank plugin aborts under env var; main test process should survive and recover.
+    add_test(NAME plugin_blank_process_crash_isolated
+        COMMAND ax_plugin_client_test
+            --mode=process
+            --crash-test=1
+            --so=$<TARGET_FILE:ax_plugin_blank>
+    )
+endif()

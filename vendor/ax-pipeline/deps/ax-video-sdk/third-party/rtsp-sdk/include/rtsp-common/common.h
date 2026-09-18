@@ -1,0 +1,136 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+#include <memory>
+#include <functional>
+#include <chrono>
+
+namespace rtsp {
+
+// 视频编码类型
+enum class CodecType {
+    H264,
+    H265
+};
+
+// 视频帧类型
+enum class FrameType {
+    IDR,    // 关键帧
+    P,      // P帧
+    B       // B帧
+};
+
+// NALU单元
+struct NaluUnit {
+    uint8_t type;           // NALU类型
+    const uint8_t* data;    // 数据指针
+    size_t size;            // 数据大小
+    bool start_code;        // 是否包含起始码
+};
+
+// 视频帧
+struct VideoFrame {
+    CodecType codec;        // 编码类型
+    FrameType type;         // 帧类型
+    uint8_t* data;          // 帧数据
+    // 智能托管的数据持有者。若非空，data 指向 managed_data->data()，
+    // 用户无需手动 delete[]。
+    std::shared_ptr<std::vector<uint8_t>> managed_data;
+    size_t size;            // 数据大小
+    uint64_t pts;           // 显示时间戳 (毫秒)
+    uint64_t dts;           // 解码时间戳 (毫秒)
+    uint32_t width;         // 宽度
+    uint32_t height;        // 高度
+    uint32_t fps;           // 帧率
+};
+
+// 音频帧
+struct AudioFrame {
+    uint8_t* data;
+    size_t size;
+    uint64_t pts;
+    uint32_t sample_rate;
+    uint32_t channels;
+    uint32_t bits_per_sample;
+};
+
+// RTP包
+struct RtpPacket {
+    uint8_t* data;
+    size_t size;
+    uint16_t seq;
+    uint32_t timestamp;
+    uint32_t ssrc;
+    bool marker;
+};
+
+// SDP媒体信息
+struct SdpMediaInfo {
+    CodecType codec = CodecType::H264;
+    std::string payload_name;
+    uint8_t payload_type = 0;
+    uint32_t clock_rate = 0;
+    std::string sps;        // Base64编码的SPS
+    std::string pps;        // Base64编码的PPS
+    std::string vps;        // Base64编码的VPS (仅HEVC)
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t fps = 0;
+};
+
+// 时间戳转换工具
+inline uint32_t convertToRtpTimestamp(uint64_t pts_ms, uint32_t clock_rate) {
+    return static_cast<uint32_t>((pts_ms * clock_rate) / 1000);
+}
+
+// Base64编码/解码
+std::string base64Encode(const uint8_t* data, size_t size);
+std::vector<uint8_t> base64Decode(const std::string& str);
+std::string md5Hex(const std::string& data);
+
+// XML 文本转义（& < > " '）。用于把任何不可信/可配置字符串拼进 XML/SOAP
+// 响应前转义，避免注入和因 & / < 破坏整份响应的良构性。
+std::string xmlEscape(const std::string& text);
+
+// 安全整数解析：失败时返回 false 并将 out 置为 0。
+// 用于所有来自网络的字段（CSeq/端口/payload_type 等），避免 std::stoi 抛异常
+// 时穿透连接处理线程、让恶意/畸形输入造成 DoS 式崩溃。
+// allow_empty=false 时空字符串视为解析失败。
+bool parseInt32Safe(const std::string& s, int32_t& out, bool allow_empty = false);
+bool parseUint32Safe(const std::string& s, uint32_t& out, bool allow_empty = false);
+bool parseUint64Safe(const std::string& s, uint64_t& out, bool allow_empty = false);
+
+// 日志级别
+enum class LogLevel {
+    Debug,
+    Info,
+    Warning,
+    Error
+};
+
+enum class LogFormat {
+    PlainText,
+    Json
+};
+
+struct LogConfig {
+    LogLevel min_level = LogLevel::Debug;
+    LogFormat format = LogFormat::PlainText;
+    bool use_utc_time = false;
+    bool include_thread_id = true;
+};
+
+using LogCallback = std::function<void(LogLevel, const std::string&)>;
+void setLogConfig(const LogConfig& config);
+LogConfig getLogConfig();
+void setLogCallback(LogCallback callback);
+void log(LogLevel level, const std::string& msg);
+
+#define RTSP_LOG_DEBUG(msg) rtsp::log(rtsp::LogLevel::Debug, msg)
+#define RTSP_LOG_INFO(msg) rtsp::log(rtsp::LogLevel::Info, msg)
+#define RTSP_LOG_WARNING(msg) rtsp::log(rtsp::LogLevel::Warning, msg)
+#define RTSP_LOG_ERROR(msg) rtsp::log(rtsp::LogLevel::Error, msg)
+
+} // namespace rtsp

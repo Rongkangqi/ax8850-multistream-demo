@@ -1,0 +1,15 @@
+#EXTM3U
+#EXTINF:-1,overview
+http://127.0.0.1:8850/overview.ts
+#EXTINF:-1,pcd
+http://127.0.0.1:8850/pcd.ts
+#EXTINF:-1,vehicle
+http://127.0.0.1:8850/vehicle.ts
+#EXTINF:-1,seg
+http://127.0.0.1:8850/seg.ts
+#EXTINF:-1,driving
+http://127.0.0.1:8850/driving.ts
+#EXTINF:-1,depth
+http://127.0.0.1:8850/depth.ts
+#EXTINF:-1,count
+http://127.0.0.1:8850/count.ts

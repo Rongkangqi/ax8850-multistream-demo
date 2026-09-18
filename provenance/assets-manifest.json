@@ -1,0 +1,68 @@
+[
+  {
+    "path": "models/pcd.axmodel",
+    "role": "model",
+    "bytes": 762444,
+    "sha256": "41fb98d1b7adfd82db67621871c6b269567c7bf7a04893f997be1d57cd6ca26b"
+  },
+  {
+    "path": "videos/traffic.mp4",
+    "role": "video",
+    "bytes": 763849711,
+    "sha256": "586d22eca7ac47962d035015101d5216052017fe50a8ff4cb1718665b7e11066"
+  },
+  {
+    "path": "models/vehicle.axmodel",
+    "role": "model",
+    "bytes": 11860681,
+    "sha256": "f112959508faa56c2d7b9a17e7ba48b9a0967bc95fb499cfc47993ce099fb0ce"
+  },
+  {
+    "path": "videos/traffic4.mp4",
+    "role": "video",
+    "bytes": 20994011,
+    "sha256": "7061eeb147b7d4ee04253ddc062348f92c57b04014e9838319b905c8132846f9"
+  },
+  {
+    "path": "models/seg.axmodel",
+    "role": "model",
+    "bytes": 3756231,
+    "sha256": "e12dd1c67dcccf3f2f136884a5f8e5cf24aca55940318affa46fb0902f3176e2"
+  },
+  {
+    "path": "videos/traffic3_slow_0p5x.mp4",
+    "role": "video",
+    "bytes": 65207820,
+    "sha256": "072a83ad2864720394f9dccb99ed50eace7a88571bcb488517d0439d89ed6ac0"
+  },
+  {
+    "path": "models/yolo26n.axmodel",
+    "role": "model",
+    "bytes": 3320801,
+    "sha256": "bbe08322f1694470f286f5fc531d4fb8fa1b92255b74011ee0b6d63cb3fae322"
+  },
+  {
+    "path": "videos/traffic7_slow_0p5x.mp4",
+    "role": "video",
+    "bytes": 76160337,
+    "sha256": "f2ecb868e51f1811cc86f51b8be92917030e6cea18b5bee357044286d31065ca"
+  },
+  {
+    "path": "models/depth.axmodel",
+    "role": "model",
+    "bytes": 6003543,
+    "sha256": "4f099b20be60f028a575c14f9bd2acab4595600584d4a08898e672be6368ec85"
+  },
+  {
+    "path": "videos/traffic5.mp4",
+    "role": "video",
+    "bytes": 33461285,
+    "sha256": "1b4e6526945eae510812065dcd3144d4a338983942dc0f539c03961c9461ed7b"
+  },
+  {
+    "path": "videos/traffic6.mp4",
+    "role": "video",
+    "bytes": 24964716,
+    "sha256": "76d5ad1a390433b044fbcaf8df9a352abd4c27bffd74a416c56d16e29ee92399"
+  }
+]
